@@ -16,6 +16,7 @@ This repository contains **only our own source code and notes**. It does **not**
 | `docs/STATUS.md` | What works / what does not / what is untested |
 | `docs/DEVELOPMENT.md` | What you need to develop, build and test; how the pieces fit |
 | `docs/GAME-NOTES.md` | Technical findings about the game (structures, offsets, file formats, packets) |
+| `docs/GAME-DATA.md`, `docs/extracted-file-list.txt`, `tools/extract/` | Analysis of the game data (level scripts, enemies) + how to unpack it yourself (no game files included) |
 | `build.sh` | Cross-build with LLVM 18 (32-bit Windows) |
 
 ## How it works (short)
@@ -46,6 +47,7 @@ MIT (see `LICENSE`): anyone may use, copy, modify and distribute the code. Game,
 | `docs/STATUS.md` | Что работает, что нет, что не проверено |
 | `docs/DEVELOPMENT.md` | Что нужно для разработки, сборки и тестов, как всё устроено |
 | `docs/GAME-NOTES.md` | Технические находки об игре (структуры, смещения, форматы, пакеты) |
+| `docs/GAME-DATA.md`, `docs/extracted-file-list.txt`, `tools/extract/` | Разбор данных игры (сценарии уровней, враги) + как распаковать самому (файлов игры нет) |
 | `build.sh` | Кросс-сборка LLVM 18 (32-битный Windows) |
 
 ## Как это работает (кратко)
