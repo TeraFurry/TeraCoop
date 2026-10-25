@@ -1,0 +1,8 @@
+LIBRARY user32.dll
+EXPORTS
+GetForegroundWindow@0
+GetWindowThreadProcessId@8
+SendInput@12
+GetAsyncKeyState@4
+CreateWindowExW@48
+DestroyWindow@4
