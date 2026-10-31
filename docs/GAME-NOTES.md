@@ -18,6 +18,19 @@ These are interoperability notes made by observing a running copy of the game; n
 | Class names | the exe contains MSVC RTTI (`.?AV…`): find a vtable by following `vtable-4 → COL → TypeDescriptor` |
 | Target of an AI character | fields `+0x230/+0x238/+0x270/+0x144` (and `+0x5ac` on player 0) point to the character currently targeted; they change when an enemy dies |
 
+## Heroes, split screen, transitions (module v2.x) / Герои, разделение, переходы
+Observed with a debugger (x32dbg) and the decompile; VA = link base `0x400000`. / Найдено отладчиком (x32dbg) и по декомпиляции; VA при базе `0x400000`.
+| What | Where |
+|---|---|
+| Hero name of a character | `ch+0x24` → char* name, `ch+0x20` = (len+1)<<16 \| capacity; duplicates get a suffix (`FrodoBaggins01`) |
+| Hero type by name | `FUN_009d9a40(name)` (cdecl); current type `FUN_0087ad10` (thiscall on the character) |
+| Swap hero | `FUN_00bd7ab0(ch, new, old, 1, 0, 0, 0)` (cdecl), needs the model loaded first |
+| Loader | class `CharLoaderUtilSwap` (vtable `0x0112ba48`, 0x24 bytes, ctor `FUN_00a52b50`); `vt[1]` = `FUN_00bf27b0(player, type)` requests the load, tick `FUN_0098b5a0` until `+4/+8 == -1` |
+| Second player list head | `DAT_015ca000` (also `Player2Active`); join via `MechDropInOut` `FUN_0094afc0` |
+| Split screen manager | mode singletons at `0x0139f840 + 8·N` (4 = ForceVerticalSplitState); submode `manager+0x60` set by `FUN_0084ee50(N)`, wanted value `manager+0xb1c` (written every frame by `FUN_008463d0`) |
+| One-screen camera | `FUN_00b85440`; at VA `0x00b86081` it reads the player 2 list (`mov edi,[0x015ca000]`) to frame both players. Own-screen mode replaces it with `xor edi,edi` |
+| Transition waits for the camera | teleport state machine `FUN_0092c620` (state `+0x8c`); step `FUN_0092c390` waits until `FUN_009775d0(camera) == 1`. Own-screen mode makes `FUN_009775d0` return 1 (`mov al,1; ret`). It is called only from `FUN_0092c390` |
+
 ## Game data / Данные игры
 - Archives `GAME.DAT … GAME4.DAT`, header `PakDat v1.01`. Unpack with QuickBMS + `ttgames.bms`. File list: `filetable.txt` in the game folder.
 - Text data worth reading: `stuff\krawlietypes.txt` (enemy types: `KrawlieType … CharDef … Baddie/Ranged`, add-ons), `stuff\game.txt` (rules, e.g. `hearts display on max 4 extramax 6`), `levels\<chapter>\<level>\<level>.txt` (which characters a level loads: `character "Name" player|resident`), `chars\chardata.txt`.

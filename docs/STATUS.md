@@ -1,47 +1,59 @@
-# Status / Состояние (2026-10-25, program v0.16, module v2.1c)
+# Status / Состояние (2026-11-01, program v0.16, module v2.14)
 
 ## English
-### Works (tested by two real players)
-- Steam P2P connection (uses Spacewar app id 480 for networking; no port forwarding), room codes, host/guest roles, ping display.
-- The module loads into the game (proxy `dinput8.dll`) and talks to the program through shared memory.
-- Player 2 can be driven from the other PC: movement axes, jump, attack, special. Actions reach the game 100% in both directions; each PC uses **its own** key bindings (parsed from the game's `Mappings.dat`).
-- Position of player 2 is made visible by rewriting every copy of the position field (the game keeps several).
-- Logs named `host_… / guest_… / solo_…` plus a one-key data-collection tool (F11, markers F3/F4/F5).
-- The game's archives (`GAME*.DAT`, PakDat v1.01) can be unpacked with community QuickBMS scripts; text data (`krawlietypes.txt`, level scripts, `game.txt`) is readable.
+### Works
+Tested by two real players over the network (program v0.16, module v2.1c, October 2026):
+- Steam P2P connection (Spacewar app id 480 for networking; no port forwarding) and IP mode (e.g. Radmin VPN), room codes, host/guest roles, ping display.
+- Player 2 can be driven from the other PC: movement, jump, attack, special. Each PC uses **its own** key bindings (parsed from the game's `Mappings.dat`).
 
-### Not done
-- **Enemies**: not synchronized. Our first attempt mirrored the game's "character list", which turned out to be the player party (two heroes + a story character such as Merry), not enemies. The mirror is now off by default (F7). Real enemies are "Krawlie" objects; how they are created and tracked is still being investigated.
-- Enemy death / health, player hearts, coins (studs), breakable objects, level transitions, loading the friend into the host's world and save, per-player cameras, installer.
-- Roll animation after a double jump and occasional sliding of player 2.
+Tested on two copies of the game on one PC (module v2.x, not yet with a friend):
+- Direct link between two copies (settings file `teracoop_local.txt` = `host` / `guest`): the other copy's player 1 is shown as my player 2, at the exact position and heading.
+- Hero sync both ways by hero name, only when the other player **changes** hero.
+- F8: change player 1 into the hero named in `teracoop_hero.txt` through the game's own loader (`CharLoaderUtilSwap`: load the model, then swap).
+- **Own screen** (`teracoop_view.txt` = `own`): one screen in each copy, the camera follows only player 1, and zone transitions still work (they no longer wait for the camera of player 2). Verified in the hub on both copies.
+- Level changes, added/killed characters and the game's current level are written to the log; window mode (`teracoop_windowed.txt`); running two copies at once (`teracoop_multi.txt`).
+
+### Broken / not done
+- **v2.14 smoothing** (speed prediction for the other hero): after this version the owner saw no sync at all. Not investigated yet; v2.13 is the last version where sync was seen working.
+- Riding (horses and other mounts) breaks the sync.
+- Transitions into buildings and inside story levels have problems (the own-screen patch was verified in the hub only).
+- The transition fade (darkening) is missing in own-screen mode.
+- Both copies can end up with the same hero for player 1, so a level shows duplicate heroes.
+- Not synchronized: enemies, health/hearts, coins, breakables, loading the guest into the host's world without his own save.
 
 ### Untested / experimental
-- F6 "pad injection" (writes input straight into player 2's pad record instead of key presses).
-- Heap scan used by the F11 tool on very different PCs.
+- F6 pad injection; the F11 heap scan on very different PCs.
 
-### Ideas / next steps
-1. Record on ordinary levels (not the horse-riding Pelennor level) and track Krawlie objects.
-2. Read the decompiled game code around `DeathContext`, `MechCharacterBaseHealthInfo`, `LotrPickup`, `ScrAction_EmitCoins` and hook those events.
-3. Synchronize deaths, coins and breakables as events from the host.
+### Next steps
+1. Find out why v2.14 loses the sync (logs of both copies).
+2. Map the systems to real function names using the public symbol list of LEGO City Undercover (Switch), which runs on the same engine branch ("Gotham", like LEGO Batman 2 and this game), see docs/DEVELOPMENT.md.
+3. Then, one system at a time: guest joins the host's world, then health, coins, enemies, objects.
 
 ## Русский
-### Работает (проверено двумя реальными игроками)
-- Соединение через Steam (для сети используется app id 480 Spacewar; без проброса портов), коды комнат, роли хост/гость, пинг.
-- Модуль загружается в игру (подменная `dinput8.dll`) и общается с программой через общую память.
-- Вторым игроком можно управлять с другого ПК: оси движения, прыжок, удар, особое. Действия доходят до игры на 100% в обе стороны; каждый ПК использует **свои** клавиши (читаются из `Mappings.dat` игры).
-- Позиция второго игрока видна за счёт перезаписи всех копий поля позиции (игра хранит их несколько).
-- Журналы `host_… / guest_… / solo_…` и сбор данных по одной клавише (F11, метки F3/F4/F5).
-- Архивы игры (`GAME*.DAT`, PakDat v1.01) распаковываются скриптами сообщества для QuickBMS; текстовые данные (`krawlietypes.txt`, сценарии уровней, `game.txt`) читаются.
+### Работает
+Проверено двумя реальными игроками по сети (программа v0.16, модуль v2.1c, октябрь 2026):
+- Соединение через Steam (для сети app id 480 Spacewar, без проброса портов) и по IP (например, Radmin VPN), коды комнат, роли хост/гость, пинг.
+- Вторым игроком можно управлять с другого ПК: движение, прыжок, удар, особое. Каждый ПК использует **свои** клавиши (читаются из `Mappings.dat` игры).
 
-### Не сделано
-- **Враги**: не синхронизируются. Первая попытка зеркалила «список персонажей» игры, а он оказался отрядом игроков (два героя и сюжетный персонаж, например Мерри), а не врагами. Зеркало теперь выключено по умолчанию (F7). Настоящие враги — объекты «Krawlie»; как они создаются и отслеживаются, пока выясняется.
-- Смерть и здоровье врагов, сердца игрока, монетки, ломающиеся предметы, переходы между уровнями, загрузка друга в мир и сохранение хоста, отдельные камеры, установщик.
-- Анимация переката после двойного прыжка и иногда скольжение второго игрока.
+Проверено на двух копиях игры на одном ПК (модуль v2.x, с другом ещё нет):
+- Прямая связь двух копий (файл `teracoop_local.txt` = `host` / `guest`): игрок 1 другой копии показывается моим игроком 2, точно по позиции и направлению.
+- Синхронизация героя в обе стороны по имени, только когда другой игрок **сам меняет** героя.
+- F8: превратить игрока 1 в героя из `teracoop_hero.txt` через загрузчик самой игры (`CharLoaderUtilSwap`: сначала загрузка модели, потом замена).
+- **Свой экран** (`teracoop_view.txt` = `own`): в каждой копии один экран, камера следит только за игроком 1, а переходы между зонами работают (они больше не ждут камеру игрока 2). Проверено в хабе на обеих копиях.
+- В журнал пишутся смены уровня, появление и гибель персонажей, текущий уровень игры; оконный режим (`teracoop_windowed.txt`); две копии одновременно (`teracoop_multi.txt`).
+
+### Сломано / не сделано
+- **Сглаживание v2.14** (предсказание по скорости для другого героя): после этой версии владелица не увидела синхронизации совсем. Ещё не разобрано; v2.13 — последняя версия, где синхронизация работала.
+- Езда верхом (лошади и другие животные) ломает синхронизацию.
+- Переходы в здания и внутри сюжетных уровней работают с ошибками (правка «свой экран» проверена только в хабе).
+- В режиме «свой экран» нет затемнения при переходе.
+- В обеих копиях у игрока 1 может оказаться один и тот же герой, и на уровне появляются двойники.
+- Не синхронизируется: враги, здоровье/сердечки, монетки, ломающиеся предметы, вход гостя в мир хоста без своего сохранения.
 
 ### Не проверено / эксперимент
-- F6 «подача в геймпад» (ввод пишется прямо в запись геймпада второго игрока вместо нажатий клавиш).
-- Сканирование кучи в инструменте F11 на сильно разных ПК.
+- F6 «подача в геймпад»; сканирование кучи в F11 на сильно разных ПК.
 
-### Планы
-1. Записи на обычных уровнях (не на «Пеленноре» верхом) и отслеживание объектов Krawlie.
-2. Прочитать декомпилированный код вокруг `DeathContext`, `MechCharacterBaseHealthInfo`, `LotrPickup`, `ScrAction_EmitCoins` и подключиться к этим событиям.
-3. Передавать смерти, монетки и ломающееся от хоста как события.
+### Дальше
+1. Выяснить, почему в v2.14 пропадает синхронизация (журналы обеих копий).
+2. Сопоставить системы игры с настоящими именами функций по открытому списку символов LEGO City Undercover (Switch). Это та же ветка движка («Gotham», как LEGO Batman 2 и наша игра), см. docs/DEVELOPMENT.md.
+3. Потом по одной системе: вход гостя в мир хоста, затем здоровье, монетки, враги, объекты.

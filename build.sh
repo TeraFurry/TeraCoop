@@ -7,9 +7,10 @@ CF="--target=i686-pc-windows-msvc -msse2 -O1 -fno-math-errno -ffreestanding -fno
 cd src/module
 llvm-dlltool -m i386 -k -d k32.def -l kernel32.lib
 llvm-dlltool -m i386 -k -d u32.def -l user32.lib
+llvm-dlltool -m i386 -k -d ws2.def -l ws2_32.lib
 llvm-rc /C 65001 /FO mod.res mod.rc
 clang $CF coop_mod.c -o coop_mod.obj
-lld-link /dll /nodefaultlib /machine:x86 /entry:DllMain /safeseh:no /dynamicbase /nxcompat /def:dinput8.def /out:dinput8.dll coop_mod.obj mod.res kernel32.lib user32.lib
+lld-link /dll /nodefaultlib /machine:x86 /entry:DllMain /safeseh:no /dynamicbase /nxcompat /def:dinput8.def /out:dinput8.dll coop_mod.obj mod.res kernel32.lib user32.lib ws2_32.lib
 cd ../program
 # the program embeds the module (resource 100) and Valve's steam_api.dll (resource 101, from the Steamworks SDK, NOT in this repo)
 # программа вшивает модуль (ресурс 100) и steam_api.dll от Valve (ресурс 101, из Steamworks SDK, в репозитории его НЕТ)

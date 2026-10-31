@@ -46,7 +46,7 @@ K void GetSystemTime(void *);
 #define SIZEOFIMAGE 0x15e6000u
 #define TIMESTAMP 0x50d201ccu
 #define VA_P2LIST 0x015ca000u /* head of the list that holds player 2 (0 = player 2 absent), found in step 31/33 of the notes */
-#define MOD_VERSION 210u
+#define MOD_VERSION 340u
 #define VA_PTABLE 0x015b30e0u /* table of the four player characters; [0] = local player 1 (steps 61-63 of the notes) */
 #define VT_PAD 0x010df7d8u    /* vtable of the character pad object (+4 owner, +0x18/+0x1c axes, +0x0C -> record whose +4 holds the held buttons) */
 
@@ -150,7 +150,7 @@ static void load_bindings(const char *why) {
 static int game_fg(void) { u32 pid = 0; PV w = GetForegroundWindow(); if (!w) return 0; GetWindowThreadProcessId(w, &pid); return pid == GetCurrentProcessId(); }
 
 /* ---------------- capture of player 1 (read only; ReadProcessMemory on this process, so a bad address cannot crash the game) ---------------- */
-static Link *lk;
+static Link *lk; static Link loc_lk;
 static int rd(u32 a, void *o, u32 n) { u32 got = 0; if (!ReadProcessMemory((PV)-1, (const void *)a, o, n, &got) || got != n) return 0; return 1; }
 static u32 rd32(u32 a) { u32 v = 0; rd(a, &v, 4); return v; }
 static i32 axis100(u32 raw) { float f = *(float *)&raw; i32 v; if (!(f > -2.0f && f < 2.0f)) return 0; v = (i32)(f * 100.0f); return v > 100 ? 100 : v < -100 ? -100 : v; }
@@ -254,15 +254,23 @@ static float pp_wrap(float a) { while (a > 3.14159265f) a -= 6.2831853f; while (
 static float pp_sin(float x) { float x2; x = pp_wrap(x); x2 = x * x; return x * (1.0f - x2 / 6.0f * (1.0f - x2 / 20.0f * (1.0f - x2 / 42.0f * (1.0f - x2 / 72.0f * (1.0f - x2 / 110.0f * (1.0f - x2 / 156.0f)))))); }
 static float pp_cos(float x) { return pp_sin(x + 1.5707963f); }
 static volatile u32 pp_net_writes, pp_net_snaps, pp_net_none; static volatile i32 pp_net_dist_mm;
+/* v2.14 (jitter): the other hero's speed from its last two packets; the puppet aims at "last position + speed x age" and moves there
+   smoothly (25 % of the gap per frame), a hard jump only above 1.5 m. Runs on the game thread (PeekMessageA hook), once per frame. */
+static volatile float loc_vx, loc_vy, loc_vz; static volatile u32 pp_in_game_thread;
 /* Part 5.3: player 2 follows the friend. Called every frame from the game thread. Returns 1 when it handled the frame. */
 static int puppet_net(void) {
   u32 c2, i; float p2[3], ex, ey, ez, dist, g, gy, dx, dy, dz, yaw, m00, m02;
   if (!lk || !lk->rem_valid || (i32)(GetTickCount() - lk->rem_tick) >= 500) return 0;
   c2 = pp_char(1); if (!c2) { pp_net_none++; return 1; }
   if (!rd(c2 + 0x190, p2, 12)) return 1;
-  ex = lk->rem_px - p2[0]; ey = lk->rem_py - p2[1]; ez = lk->rem_pz - p2[2];
+  { float tx = lk->rem_px, ty = lk->rem_py, tz = lk->rem_pz;
+    if (lk == &loc_lk) { u32 age = GetTickCount() - lk->rem_tick; float a; if (age > 120u) age = 120u; a = (float)age * 0.001f; tx += loc_vx * a; ty += loc_vy * a; tz += loc_vz * a; }
+    ex = tx - p2[0]; ey = ty - p2[1]; ez = tz - p2[2]; }
   dist = __builtin_sqrtf(ex * ex + ez * ez); pp_net_dist_mm = (i32)(dist * 1000.0f);
-  g = dist > 8.0f ? 1.0f : dist < 0.03f ? 0.0f : 0.2f; gy = (ey > 2.0f || ey < -2.0f) ? 1.0f : 0.2f; if (g == 1.0f) pp_net_snaps++;
+  g = dist > 8.0f ? 1.0f : dist < 0.03f ? 0.0f : 0.2f;
+  gy = (ey > 2.0f || ey < -2.0f) ? 1.0f : 0.2f;
+  if (lk == &loc_lk) { g = dist > 1.5f ? 1.0f : dist < 0.02f ? 0.0f : 0.25f; gy = (ey > 1.0f || ey < -1.0f) ? 1.0f : (ey > 0.02f || ey < -0.02f) ? 0.25f : 0.0f; }   /* v2.14: smooth instead of exact jumps */
+  if (g == 1.0f) pp_net_snaps++;
   dx = ex * g; dz = ez * g; dy = ey * gy;
   for (i = 0; i < sizeof PP_SELF / sizeof PP_SELF[0]; i++) pp_add(c2 + PP_SELF[i], dx, dy, dz);
   for (i = 0; i < sizeof PP_PTR / sizeof PP_PTR[0]; i++) { u32 t = rd32(c2 + PP_PTR[i][0]); if (t > 0x100000u && t < 0x7F000000u && !(t & 3)) pp_add(t + PP_PTR[i][1], dx, dy, dz); }
@@ -314,7 +322,7 @@ static void pad_inject_frame(void) {
   padi_writes++;
 }
 static void enemy_mirror_frame(void);
-static u32 __stdcall puppet_thread(PV arg) { u32 last = 0; (void)arg; for (;;) { u32 n; Sleep(10); n = GetTickCount(); if (last) { u32 g = n - last; if (g > pp_gap_max) pp_gap_max = g; } last = n; puppet_frame(); enemy_mirror_frame(); pad_inject_frame(); } return 0; }
+static u32 __stdcall puppet_thread(PV arg) { u32 last = 0; (void)arg; for (;;) { u32 n; Sleep(10); n = GetTickCount(); if (last) { u32 g = n - last; if (g > pp_gap_max) pp_gap_max = g; } last = n; if (!pp_in_game_thread) puppet_frame(); enemy_mirror_frame(); pad_inject_frame(); } return 0; }
 
 /* ---------------- Part 5: data collection (F11) - discovery for the world sync: enemies, health, deaths, coins ----------------
  * F11 (game window in front) starts a recording of up to 120 s, F11 again stops it. It works alone (no program, no friend needed: "solo"). Three files per recording, named <host|guest|solo>_<kind>_<date>_rec<N>:
@@ -714,7 +722,7 @@ typedef long (__stdcall *F_present)(PV, const void *, const void *, PV, const vo
 typedef long (__stdcall *F_reset)(PV, void *);
 static void *ov_orig_present, *ov_orig_reset;
 static PV ov_font, ov_d3dx;
-static volatile u32 ov_on, ov_frames, ov_errs, ov_hint_until, ov_last_w, ov_last_h;
+static volatile u32 ov_no_panel, ov_on, ov_frames, ov_errs, ov_hint_until, ov_last_w, ov_last_h;
 static volatile PV ov_lk;
 static void *ov_orig_end, *ov_orig_scp, *ov_orig_cd, *ov_orig_cdx;
 static volatile u32 ov_n_end, ov_n_sc, ov_n_reset, ov_n_cd, ov_n_cdx, ov_cd_flags, ov_cd_hr, ov_real_vt, ov_dummy_vt, ov_real_scvt, ov_dummy_scvt, ov_in_draw, ov_dev_ptr;
@@ -775,6 +783,154 @@ static void ov_draw(PV dev) {
   if (((long (__stdcall *)(PV))VT(dev)[3])(dev) != 0) { if (ov_font) { PV f = ov_font; ov_font = 0; ((F_rel)VT(f)[2])(f); } return; }
   ov_in_draw = 1; ov_draw2(dev); ov_in_draw = 0;
 }
+/* ---------------- v2.2: window mode (file teracoop_windowed.txt in the game folder) ----------------
+ * The game's own "-Windowed" option is dead in this build (the flag 0x0157c820 is written but never read, checked in the exe).
+ * Instead the module asks Direct3D 9 for a windowed device: in CreateDevice / Reset the documented D3DPRESENT_PARAMETERS fields
+ * Windowed (index 8) = 1 and FullScreen_RefreshRateInHz (index 12) = 0; after CreateDevice the game window gets a normal frame and size.
+ * The file may hold "width height [left top]" (default 1280 800, centred on the main screen). */
+K int SetWindowLongW(PV, int, i32);
+K int SetWindowPos(PV, PV, i32, i32, i32, i32, u32);
+K int GetSystemMetrics(int);
+K int AdjustWindowRect(i32 *, u32, int);
+static volatile u32 multi_set;
+static volatile u32 win_force, win_w = 1280, win_h = 800, win_cd_n, win_reset_n, win_fix_n, win_hwnd; static volatile i32 win_x = -1, win_y = -1;
+/* v2.12: "own screen" test (file teracoop_view.txt: "left" or "left wide"). The split screen stays on inside the game (so zone
+   transitions work), the game is kept in its ForcedVertical split submode (player 1 = left half), and the window shows only the left
+   half of the picture (Present with a source rectangle; needs swap effect COPY and no multisampling). "wide" also makes the picture
+   twice as wide as the window, so the half is not squeezed (not checked yet). F6 = left half on/off. */
+static volatile u32 view_split_now, view_full, view_sc_left, view_sc_right; static volatile u32 view_on, view_wide, view_crop, view_bb_w, view_bb_h, view_pres_n, view_pres_fail; static volatile i32 view_last_hr;
+static void win_fix_pp(void *pp) { u32 *p = (u32 *)pp; if (!p) return;
+  if (win_force) { p[8] = 1; p[12] = 0; }
+  if (view_on && !view_full && win_force) { p[0] = view_wide ? win_w * 2u : win_w; p[1] = win_h; p[4] = 0; p[5] = 0; p[6] = 3 /* D3DSWAPEFFECT_COPY */; view_bb_w = p[0]; view_bb_h = p[1]; } }
+static void win_fix_window(PV hw) {
+  i32 r[4]; i32 w, h, x, y;
+  if (!win_force || !hw) return;
+  r[0] = 0; r[1] = 0; r[2] = (i32)win_w; r[3] = (i32)win_h; AdjustWindowRect(r, 0x00CF0000u /* WS_OVERLAPPEDWINDOW */, 0);
+  w = r[2] - r[0]; h = r[3] - r[1];
+  x = win_x >= 0 ? win_x : (GetSystemMetrics(0) - w) / 2; y = win_y >= 0 ? win_y : (GetSystemMetrics(1) - h) / 2; if (x < 0) x = 0; if (y < 0) y = 0;
+  SetWindowLongW(hw, -16 /* GWL_STYLE */, (i32)0x10CF0000u /* WS_OVERLAPPEDWINDOW | WS_VISIBLE */);
+  SetWindowPos(hw, 0, x, y, w, h, 0x0004u /* NOZORDER */ | 0x0020u /* FRAMECHANGED */ | 0x0040u /* SHOWWINDOW */);
+  win_hwnd = (u32)hw; win_fix_n++;
+}
+K int FlushInstructionCache(PV, const void *, u32);
+K PV GetCurrentProcess(void);
+#define VA_SUBMODE_SET 0x008463d0u   /* FUN_008463d0(N): split manager +0xb1c = N (the split submode the game wants this frame; 1 = ForcedVertical) */
+static u32 view_patched;
+static void view_load(void) { u16 fp[460]; PV h; char t[64]; u32 got = 0, i;
+  mkpath(fp, L"teracoop_view.txt"); if (GetFileAttributesW(fp) == 0xFFFFFFFFu) return;
+  h = CreateFileW(fp, 0x80000000u, 7, 0, 3, 0x80, 0); if (h && h != (PV)-1) { ReadFile(h, t, 63, &got, 0); CloseHandle(h); }
+  for (i = 0; i + 3 < got; i++) if ((t[i] | 32) == 'l' && (t[i+1] | 32) == 'e' && (t[i+2] | 32) == 'f' && (t[i+3] | 32) == 't') view_on = 1;
+  for (i = 0; i + 3 < got; i++) if ((t[i] | 32) == 'w' && (t[i+1] | 32) == 'i' && (t[i+2] | 32) == 'd' && (t[i+3] | 32) == 'e') view_wide = 1;
+  for (i = 0; i + 3 < got; i++) if ((t[i] | 32) == 'f' && (t[i+1] | 32) == 'u' && (t[i+2] | 32) == 'l' && (t[i+3] | 32) == 'l') { view_on = 1; view_full = 1; }
+  view_crop = view_on && !view_full; }
+static void view_patch(void) {   /* mov eax,[esp+4]; mov [ecx+0xb1c],eax; ret 4  ->  mov dword [ecx+0xb1c],1; ret 4 (same 13 bytes) */
+  static const u8 want[13] = { 0x8B, 0x44, 0x24, 0x04, 0x89, 0x81, 0x1C, 0x0B, 0x00, 0x00, 0xC2, 0x04, 0x00 }, put[13] = { 0xC7, 0x81, 0x1C, 0x0B, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0xC2, 0x04, 0x00 };
+  u8 *f = (u8 *)(base - IMAGEBASE + VA_SUBMODE_SET); u32 old, i;
+  if (!view_on) return;
+  for (i = 0; i < 13; i++) if (f[i] != want[i]) { lbegin(); bs("view: split submode NOT patched (unexpected bytes at "); bh((u32)f); bs(")"); lend(); return; }
+  if (!VirtualProtect(f, 13, 0x40, &old)) { say("view: split submode NOT patched (VirtualProtect)"); return; }
+  for (i = 0; i < 13; i++) f[i] = put[i];
+  VirtualProtect(f, 13, old, &old); FlushInstructionCache(GetCurrentProcess(), f, 13); view_patched = 1;
+  lbegin(); bs("view: FUN_008463d0 at "); bh((u32)f); bs(" patched - the split submode is always 1 (ForcedVertical, player 1 left)"); lend(); }
+extern u32 tc_split_arg; extern volatile u32 tc_split_n;
+#ifndef VA_CUR_LEVEL
+#define VA_CUR_LEVEL 0x015bcc2cu
+#endif
+/* v2.12b "full": in the ForcedVertical submode FUN_008462a0(left, &p0, &p1) gives each player's place on the screen
+   (x 0.25 / 0.75, y 0.5; the split line lies between them). The module makes it p0 = (0.5, 0.5) and p1 = (10, 0.5): the line moves far
+   off the right edge, so player 1's part is the whole window (not squeezed), and the game still counts the screen as split. */
+#define VA_VSPLIT_POS 0x008462a0u
+static void view_full_patch(void) {
+  static const u8 want[8] = { 0x66, 0x83, 0x7C, 0x24, 0x04, 0x00, 0x8B, 0x44 };
+  static const u8 put[35] = { 0x8B, 0x44, 0x24, 0x08, 0xC7, 0x00, 0x00, 0x00, 0x00, 0x3F, 0xC7, 0x40, 0x04, 0x00, 0x00, 0x00, 0x3F,
+                              0x8B, 0x44, 0x24, 0x0C, 0xC7, 0x00, 0x00, 0x00, 0x20, 0x41, 0xC7, 0x40, 0x04, 0x00, 0x00, 0x00, 0x3F, 0xC3 };
+  u8 *f = (u8 *)(base - IMAGEBASE + VA_VSPLIT_POS); u32 old, i;
+  if (!view_full) return;
+  for (i = 0; i < 8; i++) if (f[i] != want[i]) { lbegin(); bs("view: split position NOT patched (unexpected bytes at "); bh((u32)f); bs(")"); lend(); return; }
+  if (!VirtualProtect(f, 35, 0x40, &old)) { say("view: split position NOT patched (VirtualProtect)"); return; }
+  for (i = 0; i < 35; i++) f[i] = put[i];
+  VirtualProtect(f, 35, old, &old); FlushInstructionCache(GetCurrentProcess(), f, 35);
+  lbegin(); bs("view: FUN_008462a0 at "); bh((u32)f); bs(" patched - player places 0.5 / 10.0: player 1's part of the split is the whole window"); lend(); }
+/* v2.12d: x32dbg + decompilation (2026-10-31): the game renders each split view in FUN_005d67c0, which first calls
+   FUN_00620c10(points, points2, count) with the view's screen polygon (vec4 points in -1..1, view+0xd80 / +0xf80, count view+0xd70).
+   FUN_00620c10 makes the clip rectangle (DAT_01567ce0..cec, flag DAT_01568204) from it; count < 3 = no clipping (whole screen).
+   In "full" mode: player 1's view (polygon on the left, x < 0) gets count 0 = whole window; player 2's view gets a tiny polygon in the
+   bottom-right corner, so it draws (almost) nothing. */
+#define VA_VIEW_POLY 0x00620c10u
+u32 tc_poly_back; static volatile u32 view_poly_p1, view_poly_p2, view_poly_other;
+static __attribute__((aligned(16))) float view_tiny[12] = { 0.998f, -0.998f, 0.0f, 1.0f,  1.0f, -0.998f, 0.0f, 1.0f,  1.0f, -1.0f, 0.0f, 1.0f };
+static __attribute__((aligned(16))) float view_tiny2[12] = { 0.998f, -0.998f, 0.0f, 1.0f,  1.0f, -0.998f, 0.0f, 1.0f,  1.0f, -1.0f, 0.0f, 1.0f };
+void __cdecl tc_on_poly(u32 *fr) { u32 n = fr[3], i; float sx = 0.0f; const float *pt = (const float *)fr[1];
+  if (!view_full || !view_split_now || n < 3 || n > 32 || !pt) { view_poly_other++; return; }
+  { float mn = 9.0f, mx = -9.0f; for (i = 0; i < n; i++) { float x = pt[i * 4]; sx += x; if (x < mn) mn = x; if (x > mx) mx = x; }
+    if (mx <= 0.02f && mn < -0.5f) { fr[3] = 0; view_poly_p1++; }                                               /* left half = player 1 */
+    else if (mn >= -0.02f && mx > 0.5f) { fr[1] = (u32)view_tiny; fr[2] = (u32)view_tiny2; fr[3] = 3; view_poly_p2++; } /* right half = player 2 */
+    else view_poly_other++; } (void)sx; }
+__attribute__((naked)) void tc_stub_poly(void) {
+  __asm__(
+    "pushfl\n\t" "pushal\n\t"
+    "leal 36(%esp), %eax\n\t" "pushl %eax\n\t"
+    "call _tc_on_poly\n\t" "addl $4, %esp\n\t"
+    "popal\n\t" "popfl\n\t"
+    "pushl %ebp\n\t" "movl %esp, %ebp\n\t" "andl $-16, %esp\n\t"
+    "jmp *_tc_poly_back\n\t");
+}
+static void view_poly_install(void) {
+  u8 *f = (u8 *)(base - IMAGEBASE + VA_VIEW_POLY); u32 old; static const u8 want[] = { 0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF0, 0x81, 0xEC, 0x64, 0x05 }; u32 i;
+  if (!view_full) return;
+  for (i = 0; i < sizeof want; i++) if (f[i] != want[i]) { lbegin(); bs("view: polygon hook NOT installed (unexpected bytes at "); bh((u32)f); bs(")"); lend(); return; }
+  tc_poly_back = (u32)f + 6;
+  if (!VirtualProtect(f, 6, 0x40, &old)) { say("view: polygon hook NOT installed (VirtualProtect)"); return; }
+  { u32 rel = (u32)tc_stub_poly - ((u32)f + 5); f[1] = (u8)rel; f[2] = (u8)(rel >> 8); f[3] = (u8)(rel >> 16); f[4] = (u8)(rel >> 24); f[5] = 0x90; f[0] = 0xE9; }
+  VirtualProtect(f, 6, old, &old); FlushInstructionCache(GetCurrentProcess(), f, 6);
+  lbegin(); bs("view: polygon hook installed at "); bh((u32)f); bs(" (FUN_00620c10: player 1's view = whole window, player 2's = tiny corner)"); lend(); }
+static void view_tick(u32 fg) { static u32 p6, sig, at; u32 k6 = (GetAsyncKeyState(0x75) & 0x8000) != 0, now = GetTickCount();
+  if (!view_on) return;
+  { static u32 was; u32 sp = tc_split_n && tc_split_arg == 0 && *(volatile const u32 *)(base - IMAGEBASE + VA_P2LIST) != 0 && rd32(base - IMAGEBASE + VA_CUR_LEVEL) != 0;
+    view_split_now = sp; if (sp != was) { was = sp; lbegin(); bs(sp ? "view: screen is split (player 2 here) - showing the left half" : "view: no split / no player 2 - whole picture"); lend(); } }
+  if (k6 && !p6 && fg) { view_crop = !view_crop; lbegin(); bs("view: F6 - left half only "); bs(view_crop ? "ON" : "OFF (whole picture)"); lend(); }
+  p6 = k6;
+  if ((i32)(now - at) >= 0) { u32 sg = view_pres_fail * 7 + (view_pres_n ? 1 : 0) + (view_poly_p1 ? 2 : 0) + (view_poly_p2 ? 4 : 0); at = now + 3000u;
+    if (sg != sig) { sig = sg; lbegin(); bs("view: picture "); bd(view_bb_w); bs("x"); bd(view_bb_h); bs(", presents "); bd(view_pres_n); bs(", failed with the half rectangle "); bd(view_pres_fail); bs(", views: player 1 whole "); bd(view_poly_p1); bs(" player 2 tiny "); bd(view_poly_p2); bs(" other "); bd(view_poly_other); if (view_pres_fail) { bs(" (last hresult "); bh((u32)view_last_hr); bs(")"); } lend(); } } }
+/* v2.13 "own screen" (file teracoop_view.txt with the word own; use together with teracoop_split.txt = off, one screen):
+   found 2026-10-31 with x32dbg + the decompilation, both checked in the game by the owner:
+   1) the one-screen camera FUN_00b85440 frames player 2 too: at VA 0x00b86081 `mov edi,[0x015ca000]` (player 2 list) -> `xor edi,edi`:
+      the camera follows only this copy's player 1;
+   2) the teleport step FUN_0092c390 waits FUN_009775d0(camera of the player) == 1, which never comes in one screen with two players
+      (FUN_009775d0 is called only there, FUN_0084f860 only from it): FUN_009775d0 -> `mov al,1; ret` - the transition does not wait. */
+#define VA_OWN_CAM  0x00b86081u
+#define VA_OWN_TELE 0x009775d0u
+static u32 own_on;
+static void own_load(void) { u16 fp[460]; PV h; char t[64]; u32 got = 0, i;
+  mkpath(fp, L"teracoop_view.txt"); if (GetFileAttributesW(fp) == 0xFFFFFFFFu) return;
+  h = CreateFileW(fp, 0x80000000u, 7, 0, 3, 0x80, 0); if (h && h != (PV)-1) { ReadFile(h, t, 63, &got, 0); CloseHandle(h); }
+  for (i = 0; i + 2 < got; i++) if ((t[i] | 32) == 'o' && (t[i+1] | 32) == 'w' && (t[i+2] | 32) == 'n') own_on = 1; }
+static int own_patch1(u32 va, const u8 *want, u32 nw, const u8 *put, u32 np, const char *what) { u8 *f = (u8 *)(base - IMAGEBASE + va); u32 old, i;
+  for (i = 0; i < nw; i++) if (f[i] != want[i]) { lbegin(); bs("own screen: "); bs(what); bs(" NOT patched (unexpected bytes at "); bh((u32)f); bs(")"); lend(); return 0; }
+  if (!VirtualProtect(f, np, 0x40, &old)) { lbegin(); bs("own screen: "); bs(what); bs(" NOT patched (VirtualProtect)"); lend(); return 0; }
+  for (i = 0; i < np; i++) f[i] = put[i];
+  VirtualProtect(f, np, old, &old); FlushInstructionCache(GetCurrentProcess(), f, np);
+  lbegin(); bs("own screen: "); bs(what); bs(" patched at "); bh((u32)f); lend(); return 1; }
+static void own_patch(void) {
+  static const u8 cam_w[6] = { 0x8B, 0x3D, 0x00, 0xA0, 0x5C, 0x01 }, cam_p[6] = { 0x31, 0xFF, 0x90, 0x90, 0x90, 0x90 };
+  static const u8 tel_w[6] = { 0x8B, 0x81, 0x30, 0x07, 0x00, 0x00 }, tel_p[3] = { 0xB0, 0x01, 0xC3 };
+  if (!own_on) return;
+  own_patch1(VA_OWN_CAM, cam_w, 6, cam_p, 6, "camera follows only player 1 (FUN_00b85440)");
+  own_patch1(VA_OWN_TELE, tel_w, 6, tel_p, 3, "transition does not wait for the camera (FUN_009775d0)"); }
+static void win_load(void) {
+  u16 fp[460]; PV h; char t[64]; u32 got = 0; i32 v[4] = { 0, 0, -1, -1 }; int n = 0, i = 0, neg = 0, in = 0;
+  mkpath(fp, L"teracoop_windowed.txt"); if (GetFileAttributesW(fp) == 0xFFFFFFFFu) return;
+  win_force = 1;
+  h = CreateFileW(fp, 0x80000000u, 7, 0, 3, 0x80, 0);
+  if (h && h != (PV)-1) { ReadFile(h, t, 63, &got, 0); CloseHandle(h); }
+  for (i = 0; i < (int)got && n < 4; i++) { char c = t[i];
+    if (c == '-' && !in) { neg = 1; continue; }
+    if (c >= '0' && c <= '9') { if (!in) { in = 1; v[n] = 0; } v[n] = v[n] * 10 + (c - '0'); }
+    else if (in) { if (neg) v[n] = -v[n]; n++; in = 0; neg = 0; } }
+  if (in && n < 4) { if (neg) v[n] = -v[n]; n++; }
+  if (n >= 2 && v[0] >= 320 && v[0] <= 7680 && v[1] >= 200 && v[1] <= 4320) { win_w = (u32)v[0]; win_h = (u32)v[1]; }
+  if (n >= 4) { win_x = v[2]; win_y = v[3]; }
+}
 static long __stdcall hk_endscene(PV dev) { if (!ov_in_draw) ov_n_end++; return ((long (__stdcall *)(PV))ov_orig_end)(dev); }
 static long __stdcall hk_scpresent(PV sc, const void *a, const void *b, PV w, const void *d, u32 fl) {
   ov_n_sc++;
@@ -787,15 +943,36 @@ static long __stdcall hk_present_r(PV dev, const void *a, const void *b, PV w, c
 static volatile u32 ov_reset_seq, ov_reset_hr, ov_reset_pre;
 static long __stdcall hk_reset_r(PV dev, void *pp) {
   long hr; ov_n_reset++; ov_reset_pre = ov_font != 0; if (ov_font) { PV f = ov_font; ov_font = 0; ((F_rel)VT(f)[2])(f); }
+  win_fix_pp(pp); if (win_force) win_reset_n++;
   hr = ((F_reset)ov_orig_reset_r)(dev, pp); ov_reset_hr = (u32)hr; ov_reset_seq++;
   return hr;
 }
+static void *view_orig_present;
+/* v2.12c: x32dbg (2026-10-31): while split, the game draws every half with the FULL viewport 1280x800 and cuts it with
+   SetScissorRect (caller 0x0066b265): left half (0,0,640,800), right half (640,0,1280,800). In "full" mode the module makes the left
+   (player 1) cut the whole window and the right (player 2) cut empty, so player 1's picture fills the window, not squeezed. */
+static void *view_orig_scissor;
+static long __stdcall hk_scissor_v(PV dev, const i32 *r) {
+  if (view_full && view_split_now && r && win_w && win_h && r[1] == 0 && r[3] == (i32)win_h) { i32 h = (i32)(win_w / 2u), t[4];
+    if (r[0] == 0 && r[2] == h) { t[0] = 0; t[1] = 0; t[2] = (i32)win_w; t[3] = (i32)win_h; view_sc_left++; return ((long (__stdcall *)(PV, const i32 *))view_orig_scissor)(dev, t); }
+    if (r[0] == h && r[2] == (i32)win_w) { t[0] = 0; t[1] = 0; t[2] = 0; t[3] = 0; view_sc_right++; return ((long (__stdcall *)(PV, const i32 *))view_orig_scissor)(dev, t); } }
+  return ((long (__stdcall *)(PV, const i32 *))view_orig_scissor)(dev, r); }
+static long __stdcall hk_present_v(PV dev, const void *a, const void *b, PV w, const void *d) {
+  long hr; view_pres_n++;
+  if (view_crop && view_split_now && view_bb_w && view_bb_h && !a) { i32 src[4]; src[0] = 0; src[1] = 0; src[2] = (i32)(view_bb_w / 2u); src[3] = (i32)view_bb_h;
+    hr = ((F_present)view_orig_present)(dev, src, 0, w, d); if (hr < 0) { view_pres_fail++; view_last_hr = hr; hr = ((F_present)view_orig_present)(dev, a, b, w, d); } return hr; }
+  return ((F_present)view_orig_present)(dev, a, b, w, d); }
 static long __stdcall hk_cd(PV d3d, u32 ad, u32 dt, PV hw, u32 fl, void *pp, PV *ppd) {
-  long hr = ((long (__stdcall *)(PV, u32, u32, PV, u32, void *, PV *))ov_orig_cd)(d3d, ad, dt, hw, fl, pp, ppd);
+  long hr; win_fix_pp(pp); if (win_force) win_cd_n++;
+  hr = ((long (__stdcall *)(PV, u32, u32, PV, u32, void *, PV *))ov_orig_cd)(d3d, ad, dt, hw, fl, pp, ppd);
   ov_n_cd++; ov_cd_flags = fl; ov_cd_hr = (u32)hr;
+  if (hr >= 0 && win_force) win_fix_window(pp && ((u32 *)pp)[7] ? (PV)((u32 *)pp)[7] : hw);
   if (hr >= 0 && ppd && *ppd) { PV sc = 0; ov_dev_ptr = (u32)*ppd; ov_real_vt = (u32)VT(*ppd);
     if ((u32)VT(*ppd) != ov_dummy_vt) { void **rv = VT(*ppd); u32 old; /* the game makes its own table (pure device): patch that one with its own originals */
-      if (rv[17] != (void *)hk_present_r && VirtualProtect(&rv[16], 8, 4, &old)) { ov_orig_reset_r = rv[16]; ov_orig_present_r = rv[17]; rv[16] = (void *)hk_reset_r; rv[17] = (void *)hk_present_r; VirtualProtect(&rv[16], 8, old, &old); ov_patched_vt = (u32)rv; } }
+      if (ov_no_panel) { if (rv[16] != (void *)hk_reset_r && VirtualProtect(&rv[16], 4, 4, &old)) { ov_orig_reset_r = rv[16]; rv[16] = (void *)hk_reset_r; VirtualProtect(&rv[16], 4, old, &old); }
+        if (view_on && rv[17] != (void *)hk_present_v && VirtualProtect(&rv[17], 4, 4, &old)) { view_orig_present = rv[17]; rv[17] = (void *)hk_present_v; VirtualProtect(&rv[17], 4, old, &old); }
+        if (0 && view_full && rv[75] != (void *)hk_scissor_v && VirtualProtect(&rv[75], 4, 4, &old)) { view_orig_scissor = rv[75]; rv[75] = (void *)hk_scissor_v; VirtualProtect(&rv[75], 4, old, &old); } }
+      else if (rv[17] != (void *)hk_present_r && VirtualProtect(&rv[16], 8, 4, &old)) { ov_orig_reset_r = rv[16]; ov_orig_present_r = rv[17]; rv[16] = (void *)hk_reset_r; rv[17] = (void *)hk_present_r; VirtualProtect(&rv[16], 8, old, &old); ov_patched_vt = (u32)rv; } }
     if (((long (__stdcall *)(PV, u32, PV *))VT(*ppd)[14])(*ppd, 0, &sc) >= 0 && sc) { ov_real_scvt = (u32)VT(sc); ((F_rel)VT(sc)[2])(sc); } }
   return hr;
 }
@@ -810,6 +987,7 @@ static long __stdcall hk_present(PV dev, const void *a, const void *b, PV w, con
 static long __stdcall hk_reset(PV dev, void *pp) {
   ov_n_reset++;
   if (ov_font) { PV f = ov_font; ov_font = 0; ((F_rel)VT(f)[2])(f); }
+  win_fix_pp(pp); if (win_force) win_reset_n++;
   return ((F_reset)ov_orig_reset)(dev, pp);
 }
 /* returns 0 = hooked, otherwise a step number (and the HRESULT in *hr) */
@@ -825,6 +1003,8 @@ static int ov_install(long *hr) {
   *hr = ((long (__stdcall *)(PV, u32, u32, PV, u32, void *, PV *))VT(d3d)[16])(d3d, 0, 1 /* HAL */, hw, 0x22 /* SOFTWARE_VERTEXPROCESSING | FPU_PRESERVE */, pp, &dev);
   if (*hr < 0 || !dev) { DestroyWindow(hw); ((F_rel)VT(d3d)[2])(d3d); return 5; }
   vt = VT(dev);
+  if (ov_no_panel) { void **dv = VT(d3d); if (VirtualProtect(&dv[16], 4, 4, &old)) { ov_orig_cd = dv[16]; dv[16] = (void *)hk_cd; VirtualProtect(&dv[16], 4, old, &old); }
+    ((F_rel)VT(dev)[2])(dev); ((F_rel)VT(d3d)[2])(d3d); DestroyWindow(hw); return 0; }
   if (!VirtualProtect(&vt[16], 8, 4 /* PAGE_READWRITE */, &old)) { ((F_rel)VT(dev)[2])(dev); ((F_rel)VT(d3d)[2])(d3d); DestroyWindow(hw); return 6; }
   ov_orig_reset = vt[16]; ov_orig_present = vt[17]; vt[16] = (void *)hk_reset; vt[17] = (void *)hk_present;
   VirtualProtect(&vt[16], 8, old, &old);
@@ -839,6 +1019,485 @@ static int ov_install(long *hr) {
   return 0;
 }
 
+/* ---------------- v2.2: character events of the game (found 2026-10-27, steps 92-94 of the notes) ----------------
+ * FUN_0095d300(obj)     = the game broadcasts "game object added"  (called when a character is created / re-added)
+ * FUN_0095d380(obj, by) = the game broadcasts "game object killed" (by = killer, 0 = nobody)
+ * Both start with "push -1; push imm32; mov eax, fs:[0]". The first 7 bytes are replaced by a jump to a small stub that queues the
+ * event and then runs those 7 bytes itself. The queue is read by the worker thread, which writes the log (the game thread never writes files). */
+static void lv_str(u32 p);
+#define VA_LEVEL_TAB 0x015bcc28u
+#define VA_LEVEL_CNT 0x015bcc34u
+#define VA_EV_ADDED  0x0095d300u
+#define VA_EV_KILLED 0x0095d380u
+typedef struct { u32 kind, obj, by, t; float p[3]; u32 hp; } TcEv;
+#define TCEV_N 256u
+static TcEv tcev[TCEV_N]; static volatile u32 tcev_w, tcev_r, tcev_lost, tcev_lock;   /* w / r only change under the lock */
+u32 tc_added_imm, tc_added_back, tc_killed_imm, tc_killed_back;
+static void tc_lock(void) { while (__sync_lock_test_and_set(&tcev_lock, 1u)) { } }
+static void tc_unlock(void) { __sync_lock_release(&tcev_lock); }
+static void tcev_put(u32 kind, u32 obj, u32 by) {
+  TcEv e; u8 h[2] = { 0, 0 };
+  e.kind = kind; e.obj = obj; e.by = by; e.t = GetTickCount(); e.p[0] = e.p[1] = e.p[2] = 0.0f;
+  if (obj && kind <= 2) { rd(obj + 0x190, e.p, 12); rd(obj + 0x706, h, 2); }
+  e.hp = ((u32)h[0] << 8) | h[1];   /* max (+0x706), current (+0x707) */
+  tc_lock();
+  if (tcev_w - tcev_r < TCEV_N) { tcev[tcev_w % TCEV_N] = e; tcev_w++; } else tcev_lost++;
+  tc_unlock();
+}
+void __cdecl tc_on_added(u32 obj) { tcev_put(1, obj, 0); }
+void __cdecl tc_on_killed(u32 obj, u32 by) { tcev_put(2, obj, by); }
+__attribute__((naked)) void tc_stub_added(void) {
+  __asm__(
+    "pushfl\n\t" "pushal\n\t"
+    "movl 40(%esp), %eax\n\t" "pushl %eax\n\t"
+    "call _tc_on_added\n\t" "addl $4, %esp\n\t"
+    "popal\n\t" "popfl\n\t"
+    "pushl $-1\n\t" "pushl _tc_added_imm\n\t" "jmp *_tc_added_back\n\t");
+}
+__attribute__((naked)) void tc_stub_killed(void) {
+  __asm__(
+    "pushfl\n\t" "pushal\n\t"
+    "movl 44(%esp), %eax\n\t" "pushl %eax\n\t"
+    "movl 44(%esp), %eax\n\t" "pushl %eax\n\t"
+    "call _tc_on_killed\n\t" "addl $8, %esp\n\t"
+    "popal\n\t" "popfl\n\t"
+    "pushl $-1\n\t" "pushl _tc_killed_imm\n\t" "jmp *_tc_killed_back\n\t");
+}
+/* v2.2g: every level change of the story goes through FUN_00b169d0(index, flag) (thiscall, this = 0x013B7B6C); same entry bytes as above */
+#define VA_EV_GOTO 0x00b169d0u
+u32 tc_goto_imm, tc_goto_back; static volatile u32 tc_goto_mine;
+static u32 loc_role;
+static volatile u32 lg_idx = 0xFFFFFFFFu, lg_flag, lg_t, lg_n, lg_any_t, lg_any_n, lg_any_idx = 0xFFFFFFFFu, lg_prev_idx = 0xFFFFFFFFu, lg_dur;   /* last level request made by the game itself (not by the module) */
+void __cdecl tc_on_goto(u32 idx, u32 flag) { u32 t = GetTickCount(); lg_any_t = t; lg_any_n++; lg_any_idx = idx; if (!tc_goto_mine || loc_role == 1) { lg_prev_idx = lg_idx; lg_dur = lg_n ? t - lg_t : 0; lg_idx = idx; lg_flag = flag; lg_t = GetTickCount(); lg_n++; } tcev_put(tc_goto_mine ? 4 : 3, idx, flag); }
+__attribute__((naked)) void tc_stub_goto(void) {
+  __asm__(
+    "pushfl\n\t" "pushal\n\t"
+    "movl 44(%esp), %eax\n\t" "pushl %eax\n\t"
+    "movl 44(%esp), %eax\n\t" "pushl %eax\n\t"
+    "call _tc_on_goto\n\t" "addl $8, %esp\n\t"
+    "popal\n\t" "popfl\n\t"
+    "pushl $-1\n\t" "pushl _tc_goto_imm\n\t" "jmp *_tc_goto_back\n\t");
+}
+/* v2.7: the split-screen manager. FUN_0085b9a0(mode) (thiscall, this = [game object + 0x68], object class cNewSplitScreenManager, current mode at this+0x13f8)
+ * is called at every level start by FUN_009d6120 (mode 0 or 1). Its first bytes 56 57 8B 7C 24 0C (push esi; push edi; mov edi,[esp+0xC]) are
+ * replaced by a jump to a stub that remembers this + mode and then runs those 6 bytes itself. */
+#define VA_SPLIT_FN 0x0085b9a0u
+u32 tc_split_mgr, tc_split_arg, tc_split_back; volatile u32 tc_split_n, tc_split_mine;
+__attribute__((naked)) void tc_stub_split(void) {
+  __asm__(
+    "pushl %eax\n\t"
+    "movl %ecx, _tc_split_mgr\n\t"
+    "movl 8(%esp), %eax\n\t" "movl %eax, _tc_split_arg\n\t"
+    "incl _tc_split_n\n\t"
+    "popl %eax\n\t"
+    "pushl %esi\n\t" "pushl %edi\n\t" "movl 12(%esp), %edi\n\t"
+    "jmp *_tc_split_back\n\t");
+}
+/* v2.9a: who calls the game's hero change FUN_00bd7ab0(char, new type, old type, a4, a5, a6, a7) (cdecl)? First bytes 55 8B EC 83 E4 F0
+   (push ebp; mov ebp,esp; and esp,-16) are replaced by a jump to a stub that queues the arguments, the return address and every
+   code address found in the next 96 stack dwords, then runs those 6 bytes itself. */
+#define VA_SWAP_HOOK 0x00bd7ab0u
+typedef struct { u32 a[8]; u32 st[12]; u32 nst, t, mine; } TcSw;
+static TcSw tcsw[16]; static volatile u32 tcsw_w, tcsw_r, tcsw_lost; u32 tc_swap_back; static volatile u32 tc_swap_mine;
+void __cdecl tc_on_swap(u32 *fr) { TcSw e; u32 i, v; e.t = GetTickCount(); e.mine = tc_swap_mine; e.nst = 0;
+  for (i = 0; i < 8; i++) e.a[i] = fr[i];   /* a[0] = return address, a[1..7] = arguments */
+  for (i = 1; i < 96 && e.nst < 12; i++) { v = fr[8 + i - 1]; if (v >= base + 0x1000u && v < base + 0x949000u) e.st[e.nst++] = v; }
+  tc_lock(); if (tcsw_w - tcsw_r < 16u) { tcsw[tcsw_w % 16u] = e; tcsw_w++; } else tcsw_lost++; tc_unlock(); }
+__attribute__((naked)) void tc_stub_swap(void) {
+  __asm__(
+    "pushfl\n\t" "pushal\n\t"
+    "leal 36(%esp), %eax\n\t" "pushl %eax\n\t"
+    "call _tc_on_swap\n\t" "addl $4, %esp\n\t"
+    "popal\n\t" "popfl\n\t"
+    "pushl %ebp\n\t" "movl %esp, %ebp\n\t" "andl $-16, %esp\n\t"
+    "jmp *_tc_swap_back\n\t");
+}
+K int FlushInstructionCache(PV, const void *, u32);
+K PV GetCurrentProcess(void);
+static int tc_hook(u32 va, void (*stub)(void), u32 *imm, u32 *back, const char *what) {
+  u8 *f = (u8 *)(base - IMAGEBASE + va); u32 old; int ok;
+  ok = f[0] == 0x6a && f[1] == 0xff && f[2] == 0x68 && f[7] == 0x64 && f[8] == 0xa1 && f[9] == 0 && f[10] == 0 && f[11] == 0 && f[12] == 0;
+  lbegin(); bs("events: hook "); bs(what); bs(" at "); bh((u32)f);
+  if (!ok) { bs(" NOT installed (unexpected bytes "); bh(*(u32 *)f); bs(")"); lend(); return 0; }
+  *imm = *(u32 *)(f + 3); *back = (u32)f + 7;
+  if (!VirtualProtect(f, 7, 0x40 /* PAGE_EXECUTE_READWRITE */, &old)) { bs(" NOT installed (VirtualProtect failed)"); lend(); return 0; }
+  { u32 rel = (u32)stub - ((u32)f + 5); f[1] = (u8)rel; f[2] = (u8)(rel >> 8); f[3] = (u8)(rel >> 16); f[4] = (u8)(rel >> 24); f[5] = 0x90; f[6] = 0x90; f[0] = 0xE9; }
+  VirtualProtect(f, 7, old, &old); FlushInstructionCache(GetCurrentProcess(), f, 7);
+  bs(" installed"); lend(); return 1;
+}
+static int swap_install(void) {
+  u8 *f = (u8 *)(base - IMAGEBASE + VA_SWAP_HOOK); u32 old; static const u8 want[] = { 0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF0, 0x6A, 0xFF }; u32 i;
+  for (i = 0; i < sizeof want; i++) if (f[i] != want[i]) { lbegin(); bs("hero: swap hook NOT installed (unexpected bytes at "); bh((u32)f); bs(")"); lend(); return 0; }
+  tc_swap_back = (u32)f + 6;
+  if (!VirtualProtect(f, 6, 0x40, &old)) { say("hero: swap hook NOT installed (VirtualProtect)"); return 0; }
+  { u32 rel = (u32)tc_stub_swap - ((u32)f + 5); f[1] = (u8)rel; f[2] = (u8)(rel >> 8); f[3] = (u8)(rel >> 16); f[4] = (u8)(rel >> 24); f[5] = 0x90; f[0] = 0xE9; }
+  VirtualProtect(f, 6, old, &old); FlushInstructionCache(GetCurrentProcess(), f, 6);
+  lbegin(); bs("hero: swap hook installed at "); bh((u32)f); bs(" (FUN_00bd7ab0, every hero change of the game is logged as SWAP)"); lend(); return 1;
+}
+static void swap_drain(void) { TcSw got[16]; u32 n = 0, i, k;
+  tc_lock(); while (n < 16 && tcsw_r != tcsw_w) { got[n++] = tcsw[tcsw_r % 16u]; tcsw_r++; } tc_unlock();
+  for (i = 0; i < n; i++) { TcSw *e = &got[i];
+    lbegin(); bs("SWAP "); bs(e->mine ? "(module F8) " : "(game) "); bs("char "); bh(e->a[1]); bs(" type "); bi((i32)e->a[3]); bs(" -> "); bi((i32)e->a[2]);
+    bs(" args "); bd(e->a[4]); bs(" "); bd(e->a[5]); bs(" "); bd(e->a[6]); bs(" "); bd(e->a[7]); bs(" | called from "); bh(e->a[0] - base + IMAGEBASE); lend();
+    lbegin(); bs("  stack code addresses:"); for (k = 0; k < e->nst; k++) { bs(" "); bh(e->st[k] - base + IMAGEBASE); } lend(); }
+}
+static int split_install(void) {
+  u8 *f = (u8 *)(base - IMAGEBASE + VA_SPLIT_FN); u32 old; static const u8 want[] = { 0x56, 0x57, 0x8B, 0x7C, 0x24, 0x0C, 0x8B, 0xF1, 0x39, 0xBE, 0xF8, 0x13 }; u32 i;
+  for (i = 0; i < sizeof want; i++) if (f[i] != want[i]) { lbegin(); bs("split: hook NOT installed (unexpected bytes at "); bh((u32)f); bs(")"); lend(); return 0; }
+  tc_split_back = (u32)f + 6;
+  if (!VirtualProtect(f, 6, 0x40, &old)) { say("split: hook NOT installed (VirtualProtect)"); return 0; }
+  { u32 rel = (u32)tc_stub_split - ((u32)f + 5); f[1] = (u8)rel; f[2] = (u8)(rel >> 8); f[3] = (u8)(rel >> 16); f[4] = (u8)(rel >> 24); f[5] = 0x90; f[0] = 0xE9; }
+  VirtualProtect(f, 6, old, &old); FlushInstructionCache(GetCurrentProcess(), f, 6);
+  lbegin(); bs("split: hook installed at "); bh((u32)f); bs(" - F7 = one screen for every level on/off, teracoop_split.txt with the word off = on from the start"); lend(); return 1;
+}
+static void tc_who(u32 a) { u32 i; if (!a) { bs("nobody"); return; } bh(a); for (i = 0; i < 4; i++) if (rd32(base - IMAGEBASE + VA_PTABLE + i * 4) == a) { bs(" (player table ["); bd(i); bs("]"); bs(i == 0 ? " = this PC's hero)" : ")"); return; } }
+static void tcev_drain(void) {
+  static TcEv got[64]; static u32 lost_seen; u32 n = 0, i, lost;
+  tc_lock(); while (n < 64 && tcev_r != tcev_w) { got[n++] = tcev[tcev_r % TCEV_N]; tcev_r++; } lost = tcev_lost; tc_unlock();
+  for (i = 0; i < n; i++) { TcEv *e = &got[i];
+    if (e->kind >= 3) { u32 tab = rd32(base - IMAGEBASE + VA_LEVEL_TAB), cnt = rd32(base - IMAGEBASE + VA_LEVEL_CNT);
+      lbegin(); bs(e->kind == 4 ? "GOTO request (module F5) index " : "GOTO request (game) index "); bd(e->obj); bs(" ");
+      if (e->obj < cnt) lv_str(rd32(tab + e->obj * 0xE0u + 0x3c)); else bs("(out of table)"); bs(" flag "); bd(e->by); lend(); continue; }
+    lbegin(); bs(e->kind == 1 ? "ADDED  obj " : "KILLED obj "); tc_who(e->obj);
+    if (e->kind == 2) { bs(" by "); tc_who(e->by); }
+    bs(" pos mm "); bi(f2mm(e->p[0])); bs(" "); bi(f2mm(e->p[1])); bs(" "); bi(f2mm(e->p[2]));
+    bs(" hearts "); bd(e->hp & 0xFFu); bs("/"); bd(e->hp >> 8); lend(); }
+  if (lost != lost_seen) { lost_seen = lost; lbegin(); bs("events: queue full, lost "); bd(lost); lend(); }
+}
+
+/* ---------------- v2.2d: current level (read only) ----------------
+ * FUN_00b8aa20 (runs when a level starts) keeps the previous level in 0x015bc178 and puts the new one in DAT_015bcc2c = level instance + 0x10.
+ * That is an entry of the level table DAT_015bcc28 (0xE0 bytes each, count DAT_015bcc34, loaded from levels\levels.txt):
+ * +0x38 dir (char *), +0x3c name (char *), +0x58 index (short). FUN_00b169d0(index) asks the game to go to a level by index. */
+#define VA_CUR_LEVEL 0x015bcc2cu
+static void lv_str(u32 p) { char t[64]; int i; if (!p || !rd(p, t, 63)) { bs("?"); return; } t[63] = 0; for (i = 0; t[i]; i++) if (t[i] < 32 || t[i] > 126) { bs("?"); return; } bs(t); }
+/* v2.2f: the game's own "current level" accessor (used by FUN_00b61c40, FUN_00b8aa20 and others):
+ *   entry = DAT_013b7b94 (= level object 0x013b7b6c + 0x28, written by FUN_00b169d0 when a level is redirected) if not 0,
+ *   else FUN_009ee6a0(): mgr = DAT_015ae0a0; p = mgr+0xbc; name = *(p + 0x30) (bytes: call 0x814c50; mov ecx,[eax+0xbc]; call 0x814c90 (= ecx+0x24); mov ebx,[eax+0xc]),
+ *   then the level table is searched by that name. The module copies this with safe reads (no call into the game). */
+#define VA_LEVEL_OVR 0x013b7b94u
+#define VA_STREAM_MGR 0x015ae0a0u
+static u32 lv_by_name(u32 name, u32 tab, u32 cnt) { char a[64], b[64]; u32 i; int k;
+  if (!name || !tab || cnt > 4096 || !rd(name, a, 63)) return 0; a[63] = 0;
+  for (i = 0; i < cnt; i++) { u32 e = tab + i * 0xE0u, n = rd32(e + 0x3c); if (!n || !rd(n, b, 63)) continue; b[63] = 0;
+    for (k = 0; a[k] && b[k]; k++) { char x = a[k], y = b[k]; if (x >= 'a' && x <= 'z') x -= 32; if (y >= 'a' && y <= 'z') y -= 32; if (x != y) break; }
+    if (!a[k] && !b[k]) return e; }
+  return 0; }
+static void lv_line(const char *what, u32 e, u32 tab, u32 cnt) { u16 idx = 0xFFFF;
+  lbegin(); bs(what);
+  if (!e) { bs("none"); lend(); return; }
+  rd(e + 0x58, &idx, 2); bs("index "); bd(idx); bs(" name "); lv_str(rd32(e + 0x3c)); bs(" dir "); lv_str(rd32(e + 0x38));
+  if (tab && e >= tab && (e - tab) % 0xE0u == 0) { bs(" (slot "); bd((e - tab) / 0xE0u); bs(" of "); bd(cnt); bs(")"); } else bs(" (not inside the level table!)");
+  lend(); }
+static u32 hm_reset_seq;
+static void level_tick(void) {
+  static u32 prev = 0xFFFFFFFFu, prev2 = 0xFFFFFFFFu, at; u32 e = rd32(base - IMAGEBASE + VA_CUR_LEVEL), tab, cnt, e2, ovr, mgr, p, nm; u32 now = GetTickCount();
+  tab = rd32(base - IMAGEBASE + VA_LEVEL_TAB); cnt = rd32(base - IMAGEBASE + VA_LEVEL_CNT);
+  if (e != prev) { prev = e; hm_reset_seq++; lv_line("LEVEL (old field 0x015bcc2c) now ", e, tab, cnt); }
+  if ((i32)(now - at) < 0) return; at = now + 100u;   /* the name search is done 10 times a second */
+  ovr = rd32(base - IMAGEBASE + VA_LEVEL_OVR); e2 = ovr;
+  if (!e2) { mgr = rd32(base - IMAGEBASE + VA_STREAM_MGR); p = mgr ? rd32(mgr + 0xbc) : 0; nm = p ? rd32(p + 0x30) : 0; e2 = lv_by_name(nm, tab, cnt); }
+  if (e2 != prev2) { prev2 = e2; lv_line(ovr ? "CURLEVEL (game accessor, override 0x013b7b94) now " : "CURLEVEL (game accessor) now ", e2, tab, cnt); }
+}
+
+/* ---------------- v2.2e: go to level N (test: F5 + teracoop_goto.txt) ----------------
+ * The game changes level with FUN_00b169d0, a thiscall on the static object 0x013B7B6C with (index, 0) - seen in the bytes of FUN_00b5bc30
+ * ("push 0; push index; mov ecx, 0x013B7B6C; call 0x00B169D0"); x32dbg showed every level change of the story going through it.
+ * It must run on the game's main thread, so the module replaces the PeekMessageA entry of the game's import table (VA 0x00D492B0):
+ * the message pump FUN_00670990 runs between frames on the main thread, and there a waiting request is carried out. */
+#define VA_GOTO_FN   0x00b169d0u
+#define VA_GOTO_THIS 0x013b7b6cu
+#define VA_IAT_PEEK  0x00d492b0u
+typedef int (__stdcall *F_peek)(PV, PV, u32, u32, u32);
+typedef u32 (__thiscall *F_goto)(PV, i32, i32);
+static F_peek goto_orig_peek; static volatile i32 goto_req = -1, goto_flag = 0, goto_done_idx = -1; static volatile u32 goto_done_ret, goto_seq, goto_skipped;
+static volatile u32 kbi_extra_dik, kbi_extra_until; static volatile u32 kbi_on, kbi_mask, kbi_f2_until, kbi_st_calls, kbi_dt_calls, kbi_dt_events, kbi_writes, kbi_fixed, kbi_acq_calls, kbi_acq_fail;
+static volatile i32 split_req = -1, split_want = -1; static volatile u32 split_off_on; static volatile u32 split_done_seq;
+#define VA_WIN_ACTIVE 0x01352838u   /* the game's "my window is active" flag (WndProc: WM_ACTIVATE / WM_ACTIVATEAPP); FUN_0066ec90 ignores every key while it is 0 */
+/* v2.9: change player 1's hero by name, the way the game's own script command "SwapCharacterType" (FUN_00515fc0) does it:
+   type = FUN_009d9a40(name) (cdecl, -1 = unknown), old = FUN_0087ad10() (thiscall, ECX = character), FUN_00bd7ab0(char, type, old, 1, 0, 0, 0) (cdecl). */
+#define VA_TYPE_BY_NAME 0x009d9a40u
+#define VA_CUR_TYPE     0x0087ad10u
+#define VA_SWAP_TYPE    0x00bd7ab0u
+static volatile u32 hero_req, hero_req_slot, hero_seq, hero_res_ch, hero_res_slot; static volatile i32 hero_res_type = -9, hero_res_old = -9; static volatile u32 hero_res_ret; static char hero_want[48];
+static u32 pp_char(u32 slot);
+/* v2.9b: the swap alone does nothing while the new hero's model is not loaded (test v2.9). The game itself (FUN_0092fe90) makes a
+   CharLoaderUtilSwap object (0x24 bytes, constructor FUN_00a52b50, vtable 0x0112ba48), asks vt[1] = FUN_00bf27b0(player, type) to load
+   the hero, then every frame FUN_0098b5a0 (calls vt[2] = FUN_00bf2920 for players 0 and 1: swaps when loaded) until FUN_0098b5c0 says done
+   (+4 and +8 both -1). The module does the same with its own object. */
+#define VA_CLU_CTOR   0x00a52b50u
+#define VA_CLU_TICK   0x0098b5a0u
+#define VA_CLU_VT     0x0112ba48u
+#define VA_CLU_ASK    0x00bf27b0u
+static u32 hsw[16]; static u32 hsw_made, hsw_busy, hsw_t0; static volatile u32 hsw_done_seq, hsw_done_ms, hsw_timeout, hsw_frames;
+static void hero_do(void) { u32 slot = hero_req_slot & 1u, ch = pp_char(slot); i32 t, o;
+  hero_res_slot = slot; hero_res_ch = ch; hero_res_type = -9; hero_res_old = -9; hero_res_ret = 0;
+  if (!ch) return;
+  t = ((i32 (__cdecl *)(const char *))(base - IMAGEBASE + VA_TYPE_BY_NAME))(hero_want); hero_res_type = t; if (t < 0) return;
+  o = (i32)(short)((u32 (__thiscall *)(PV))(base - IMAGEBASE + VA_CUR_TYPE))((PV)ch); hero_res_old = o;
+  if (!hsw_made) { ((void (__thiscall *)(PV))(base - IMAGEBASE + VA_CLU_CTOR))((PV)hsw); hsw_made = 1; }
+  if (hsw[0] != base - IMAGEBASE + VA_CLU_VT || rd32(hsw[0] + 4) != base - IMAGEBASE + VA_CLU_ASK) { hero_res_ret = 0xBAD0u; return; }
+  ((void (__thiscall *)(PV, i32, i32))rd32(hsw[0] + 4))((PV)hsw, (i32)slot, t);
+  hero_res_ret = 1; hsw_busy = 1; hsw_t0 = GetTickCount(); hsw_frames = 0; }
+static void hero_loader_tick(void) {
+  static u32 last; u32 now = GetTickCount();
+  if (!hsw_busy || now - last < 15u) return; last = now;
+  hsw_frames++; tc_swap_mine = 1; ((void (__thiscall *)(PV))(base - IMAGEBASE + VA_CLU_TICK))((PV)hsw); tc_swap_mine = 0;
+  if (hsw[1] == 0xFFFFFFFFu && hsw[2] == 0xFFFFFFFFu) { hsw_busy = 0; hsw_timeout = 0; hsw_done_ms = GetTickCount() - hsw_t0; hsw_done_seq++; }
+  else if (GetTickCount() - hsw_t0 > 15000u) { hsw_busy = 0; hsw_timeout = 1; hsw_done_ms = GetTickCount() - hsw_t0; hsw_done_seq++; } }
+static int __stdcall hk_peek(PV msg, PV hw, u32 a, u32 b, u32 rm) {
+  { static u32 pl; u32 n = GetTickCount(); if (n - pl >= 10u) { pl = n; pp_in_game_thread = 1; puppet_frame(); } }
+  hero_loader_tick();
+  if (hero_req && !hsw_busy) { hero_req = 0; if (*(volatile u32 *)(base - IMAGEBASE + VA_CUR_LEVEL)) hero_do(); else hero_res_ch = 0xFFFFFFFFu; hero_seq++; }
+  if (kbi_on) *(volatile u32 *)(base - IMAGEBASE + VA_WIN_ACTIVE) = 1;
+  if (split_req >= 0 && tc_split_mgr) { i32 m = split_req; split_req = -1; tc_split_mine = 1; ((void (__thiscall *)(PV, i32))(base - IMAGEBASE + VA_SPLIT_FN))((PV)tc_split_mgr, m); tc_split_mine = 0; split_done_seq++; }   /* v2.5a, host of the one-PC test only: keep reading keys while the guest window is the active one */
+  if (goto_req >= 0) {
+    i32 n = goto_req; u32 cur = *(volatile u32 *)(base - IMAGEBASE + VA_CUR_LEVEL);
+    if (!cur) goto_skipped++;   /* no level running (menu / loading): keep waiting */
+    else { goto_req = -1; tc_goto_mine = 1; goto_done_ret = ((F_goto)(base - IMAGEBASE + VA_GOTO_FN))((PV)(base - IMAGEBASE + VA_GOTO_THIS), n, goto_flag); tc_goto_mine = 0; goto_done_idx = n; goto_seq++; }
+  }
+  return goto_orig_peek(msg, hw, a, b, rm);
+}
+static void goto_install(void) {
+  u32 *slot = (u32 *)(base - IMAGEBASE + VA_IAT_PEEK), old; u8 *f = (u8 *)(base - IMAGEBASE + VA_GOTO_FN);
+  lbegin(); bs("goto: ");
+  if (!(f[0] == 0x6a && f[1] == 0xff && f[2] == 0x68)) { bs("NOT installed (unexpected bytes at the level function)"); lend(); return; }
+  if (!VirtualProtect(slot, 4, 4, &old)) { bs("NOT installed (VirtualProtect)"); lend(); return; }
+  goto_orig_peek = (F_peek)*slot; *slot = (u32)hk_peek; VirtualProtect(slot, 4, old, &old);
+  bs("PeekMessageA hook installed (original "); bh((u32)goto_orig_peek); bs("), F5 = go to the level number written in teracoop_goto.txt"); lend();
+}
+static void goto_tick(u32 fg) {
+  static u32 f5_prev, seq_seen; u32 f5 = (GetAsyncKeyState(0x74) & 0x8000) != 0;
+  if (f5 && !f5_prev && fg && !cen_on && goto_orig_peek) {
+    u16 fp[460]; PV h; char t[16]; u32 got = 0; i32 n = -1; int i; u32 tab = rd32(base - IMAGEBASE + VA_LEVEL_TAB), cnt = rd32(base - IMAGEBASE + VA_LEVEL_CNT);
+    mkpath(fp, L"teracoop_goto.txt"); h = CreateFileW(fp, 0x80000000u, 7, 0, 3, 0x80, 0);
+    if (h && h != (PV)-1) { ReadFile(h, t, 15, &got, 0); CloseHandle(h); }
+    for (i = 0; i < (int)got; i++) { if (t[i] >= '0' && t[i] <= '9') { if (n < 0) n = 0; n = n * 10 + (t[i] - '0'); } else if (n >= 0) break; }
+    lbegin();
+    if (n < 0 || (u32)n >= cnt) { bs("goto: F5 pressed, but teracoop_goto.txt has no valid level number (0.."); bd(cnt ? cnt - 1 : 0); bs(")"); }
+    else { bs("goto: F5 pressed, request level "); bd((u32)n); bs(" "); lv_str(rd32(tab + (u32)n * 0xE0u + 0x3c)); goto_flag = 0; goto_req = n; }
+    lend();
+  }
+  f5_prev = f5;
+  if (goto_seq != seq_seen) { seq_seen = goto_seq; lbegin(); bs("goto: game thread called the level change for "); bd((u32)goto_done_idx); bs(", result "); bd(goto_done_ret & 0xFFu); bs(" (1 = accepted), waited frames "); bd(goto_skipped); lend(); goto_skipped = 0; }
+}
+
+/* ---------------- v2.3: two copies on one PC talk directly over 127.0.0.1 (test without the program and Steam) ----------------
+ * teracoop_local.txt in the game folder: "host" or "guest". The host sends every level request of its game (FUN_00b169d0 index + flag) to
+ * UDP 127.0.0.1:47802 at once and repeats the last one every second. The guest listens there and, when its own game is quiet
+ * (a level is running and its game asked for no level change in the last 8 s), asks its game for the same level exactly like F5.
+ * Packet 16 bytes: 'TCLV', sequence number, level index, flag. */
+K int __stdcall WSAStartup(u16, void *);
+K u32 __stdcall socket(int, int, int);
+K int __stdcall bind(u32, const void *, int);
+K int __stdcall sendto(u32, const void *, int, int, const void *, int);
+K int __stdcall recvfrom(u32, void *, int, int, void *, int *);
+K int __stdcall ioctlsocket(u32, long, u32 *);
+#define LOC_PORT_GUEST 47802u
+#define LOC_MAGIC 0x564C4354u   /* "TCLV" */
+#define LOC_PORT_HOST 47801u
+#define LOC_MAGIC_P2 0x32504354u /* "TCP2": guest -> host, where the guest's hero is and what it presses (36 bytes) */
+static u32 loc_p2_sent_at, loc_p2_seq, loc_p2_rx, loc_p2_log_at, loc_p2_rx_logged;
+static u32 loc_pend_prev = 0xFFFFFFFFu, loc_pend_dur, loc_sched_logged; static u32 loc_sock = 0xFFFFFFFFu, loc_sent_n, loc_resend_at, loc_rx_seq, loc_pend_idx = 0xFFFFFFFFu, loc_pend_flag, loc_pend_n, loc_wait_log_at;
+static void loc_addr(u8 *a, u32 port) { int i; for (i = 0; i < 16; i++) a[i] = 0; a[0] = 2; a[2] = (u8)(port >> 8); a[3] = (u8)port; a[4] = 127; a[7] = 1; }
+static void loc_start(void) {
+  u16 fp[460]; PV h; char t[16]; u32 got = 0; u8 wsa[400], ad[16]; u32 nb = 1;
+  mkpath(fp, L"teracoop_local.txt"); if (GetFileAttributesW(fp) == 0xFFFFFFFFu) { say("local link: off (create teracoop_local.txt with the word host or guest to link two copies on this PC)"); return; }
+  h = CreateFileW(fp, 0x80000000u, 7, 0, 3, 0x80, 0); if (h && h != (PV)-1) { ReadFile(h, t, 15, &got, 0); CloseHandle(h); }
+  if (got >= 4 && (t[0] | 32) == 'h') loc_role = 1; else if (got >= 5 && (t[0] | 32) == 'g') loc_role = 2;
+  if (!loc_role) { say("local link: teracoop_local.txt must start with host or guest - link off"); return; }
+  if (WSAStartup(0x0202, wsa) != 0) { say("local link: WSAStartup failed - link off"); loc_role = 0; return; }
+  loc_sock = socket(2 /* AF_INET */, 2 /* SOCK_DGRAM */, 17 /* UDP */);
+  if (loc_sock == 0xFFFFFFFFu) { say("local link: socket failed - link off"); loc_role = 0; return; }
+  ioctlsocket(loc_sock, (long)0x8004667Eu /* FIONBIO */, &nb);
+  if (loc_role == 2) { loc_addr(ad, LOC_PORT_GUEST); if (bind(loc_sock, ad, 16) != 0) { say("local link: GUEST could not take port 47802 (another guest running?) - link off"); loc_role = 0; return; } }
+  if (loc_role == 1) { loc_addr(ad, LOC_PORT_HOST); if (bind(loc_sock, ad, 16) != 0) say("local link: HOST could not take port 47801 - the guest's hero will not arrive"); }
+  /* v2.4: no program in this test - the module fills its own copy of the program link, so the existing player-2 code (join with F2, puppet, pad writes, capture) works unchanged */
+  if (!lk) { memset(&loc_lk, 0, sizeof loc_lk); loc_lk.magic = LINK_MAGIC; loc_lk.version = LINK_VERSION; loc_lk.room_role = loc_role; loc_lk.prog_tick = GetTickCount();
+    loc_lk.want_p2 = 0; loc_lk.inject = 0; inj_pad = 0; kbi_on = 1;   /* v2.6: both copies show the other player as their player 2 */
+    lk = &loc_lk; say("local link: my hero (player 1) is sent to the other copy 50 times a second; the other hero plays player 2 here with keys inside this game only (F2 too); position corrected softly above 0.5 m"); }
+  lbegin(); bs("local link: this copy is the "); bs(loc_role == 1 ? "HOST (sends its level requests to 127.0.0.1:47802)" : "GUEST (listens on 127.0.0.1:47802 and follows the host's level)"); lend();
+}
+/* v2.8: which hero is which. Both copies load the same level with the same party, so a hero is named by its place in the game's
+ * character list (head 0x015b31e8, next +0x244; only nodes with a vtable count). Each copy sends the places of its player 1 and player 2. */
+static i32 hero_index(u32 ch) { u32 nd[64], n, i, k = 0; if (!ch) return -1; n = cen_nodes(nd, 64); for (i = 0; i < n; i++) { if (!rd32(nd[i])) continue; if (nd[i] == ch) return (i32)k; k++; } return -1; }
+static volatile i32 loc_oth_p1 = -1, loc_oth_p2 = -1;
+#define HM_ENABLED 0   /* v2.8b: hero matching by list place switched off (the place is not the same in both copies); to come back by hero name */
+static u32 hm_try, hm_key, hm_next, hm_prev_ch, hm_done, hm_start; static const u8 HM_KEYS[3] = { 0x25 /* K */, 0x18 /* O */, 0x17 /* I */ };
+/* v2.10: hero sync by NAME. Each copy sends the name of its player 1 hero (+0x24 text) in the TCP2 packet; when player 2 here
+   carries another name, the module asks the game's loader (same way as F8) to make player 2 that hero. At most one request every
+   2 s; a name the game does not know, or that did not stick after 3 requests, is left alone until the other copy's hero changes. */
+static int strcmp_s(const char *a, const char *b); static int hn_text(u32 p, char *out); static int hero_fn_ok(void);
+static char loc_oth_name[32], hs_name_tried[32]; static u32 hs_next, hs_tries, hs_names_rx, hs_pending;
+/* v2.10a: the same hero twice -> the game names the second one with a number ("FrodoBaggins01"): compare without digits at the end */
+static int hero_same(const char *mine, const char *want) { while (*want && *mine == *want) { mine++; want++; } if (*want) return 0; while (*mine >= '0' && *mine <= '9') mine++; return *mine == 0; }
+static void hero_name_of(u32 ch, char *out) { char t[48]; int i; out[0] = 0; if (!ch || !hn_text(rd32(ch + 0x24), t)) return; for (i = 0; i < 31 && t[i]; i++) out[i] = t[i]; out[i] = 0; }
+static void hero_sync_tick(u32 now) { char mine[32]; u32 c2; int i;
+  if (!hs_pending || !loc_oth_name[0] || !rd32(base - IMAGEBASE + VA_CUR_LEVEL) || !goto_orig_peek || !hero_fn_ok()) return;
+  c2 = pp_char(1); if (!c2) return;
+  hero_name_of(c2, mine); if (!mine[0]) return;
+  if (hero_same(mine, loc_oth_name)) { lbegin(); bs("hero sync: player 2 is \""); bs(mine); bs("\" like the other copy's player 1 - done"); lend(); hs_tries = 0; hs_name_tried[0] = 0; hs_pending = 0; return; }
+  if (strcmp_s(hs_name_tried, loc_oth_name)) { hs_tries = 0; for (i = 0; i < 31 && loc_oth_name[i]; i++) hs_name_tried[i] = loc_oth_name[i]; hs_name_tried[i] = 0; }
+  if (hs_tries >= 3) { if ((i32)(now - hs_next) >= 0) { hs_pending = 0; hs_tries = 0; say("hero sync: 3 tries did not work - left alone until the other player changes hero again"); } return; }
+  if (hero_req || hsw_busy || (i32)(now - hs_next) < 0) return;
+  hs_tries++; hs_next = now + 2000u;
+  for (i = 0; i < 31 && loc_oth_name[i]; i++) hero_want[i] = loc_oth_name[i]; hero_want[i] = 0;
+  lbegin(); bs("hero sync: the other copy's player 1 is \""); bs(loc_oth_name); bs("\", my player 2 is \""); bs(mine); bs("\" - asking the game (try "); bd(hs_tries); bs(")"); lend();
+  hero_req_slot = 1; hero_req = 1; }
+static void loc_p2_in(u32 *pk, u32 now) {   /* the other copy's hero -> player 2 of this game */
+  memcpy(&loc_lk.rem_px, &pk[2], 4); memcpy(&loc_lk.rem_py, &pk[3], 4); memcpy(&loc_lk.rem_pz, &pk[4], 4); memcpy(&loc_lk.rem_yaw, &pk[5], 4);
+  { static float px, py, pz; static u32 pt; float nx, ny, nz; u32 dt = now - pt; memcpy(&nx, &pk[2], 4); memcpy(&ny, &pk[3], 4); memcpy(&nz, &pk[4], 4);
+    if (pt && dt >= 5u && dt <= 200u) { float k = 1000.0f / (float)dt, vx = (nx - px) * k, vy = (ny - py) * k, vz = (nz - pz) * k;
+      if (vx > -20.0f && vx < 20.0f && vy > -20.0f && vy < 20.0f && vz > -20.0f && vz < 20.0f) { loc_vx = 0.5f * loc_vx + 0.5f * vx; loc_vy = 0.5f * loc_vy + 0.5f * vy; loc_vz = 0.5f * loc_vz + 0.5f * vz; } }
+    else if (dt > 200u) { loc_vx = loc_vy = loc_vz = 0.0f; }
+    px = nx; py = ny; pz = nz; pt = now; }
+  loc_lk.ax = (i32)pk[6]; loc_lk.ay = (i32)pk[7]; loc_lk.buttons = pk[8]; loc_lk.rem_valid = 1; loc_lk.rem_tick = now; loc_p2_rx++; loc_oth_p1 = (i32)pk[9]; loc_oth_p2 = (i32)pk[10];
+  /* v2.10a: act only when the other player's hero CHANGES (not on the first packet / level start, when both copies have the save's own heroes) */
+  { const char *nm = (const char *)&pk[11]; char t[32]; int i; for (i = 0; i < 31 && nm[i]; i++) t[i] = nm[i]; t[i] = 0;
+    if (t[0] && strcmp_s(t, loc_oth_name)) { int first = loc_oth_name[0] == 0; for (i = 0; i < 32; i++) loc_oth_name[i] = t[i];
+      lbegin(); bs("hero sync: the other copy's player 1 is now \""); bs(t); bs(first ? "\" (first packet - nothing changed here)" : "\" - my player 2 follows"); lend();
+      if (!first) { hs_pending = 1; hs_tries = 0; hs_next = 0; } }
+    hs_names_rx++; } }
+static void loc_level_in(u32 *pk) {
+  if (pk[1] == loc_rx_seq) return;
+  loc_rx_seq = pk[1]; loc_pend_idx = pk[2]; loc_pend_flag = pk[3]; loc_pend_prev = pk[4]; loc_pend_dur = pk[5]; loc_pend_n++; loc_sched_logged = 0;
+  lbegin(); bs("local link: host is going to level "); bd(pk[2]); bs(" flag "); bd(pk[3]); bs(" (host request #"); bd(pk[1]); bs(", host spent "); bd(pk[5] / 1000u); bs(" s in level "); bd(pk[4]); bs(")"); lend(); }
+static void loc_tick(u32 now) {
+  static u32 hm_seen;
+  if (!loc_role) return;
+  if (hm_reset_seq != hm_seen) { hm_seen = hm_reset_seq; hm_done = 0; hm_try = 0; hm_key = 0; hm_start = 0; hm_next = 0; }
+  if (lk == &loc_lk) loc_lk.prog_tick = now;
+  /* v2.6: both copies send their own hero (player 1) to the other one, 50 times a second */
+  if (lk == &loc_lk && (i32)(now - loc_p2_sent_at) >= 20) { u32 pk[19]; u8 ad[16];
+    loc_p2_sent_at = now;
+    if (loc_lk.cap_pos_valid && (i32)(now - loc_lk.cap_tick) < 200) { pk[0] = LOC_MAGIC_P2; pk[1] = ++loc_p2_seq; memcpy(&pk[2], &loc_lk.cap_px, 4); memcpy(&pk[3], &loc_lk.cap_py, 4); memcpy(&pk[4], &loc_lk.cap_pz, 4); memcpy(&pk[5], &loc_lk.cap_yaw, 4);
+      pk[6] = (u32)loc_lk.cap_ax; pk[7] = (u32)loc_lk.cap_ay; pk[8] = loc_lk.cap_buttons; pk[9] = (u32)hero_index(pp_char(0)); pk[10] = (u32)hero_index(pp_char(1)); memset(&pk[11], 0, 32); hero_name_of(pp_char(0), (char *)&pk[11]); loc_addr(ad, loc_role == 1 ? LOC_PORT_GUEST : LOC_PORT_HOST); sendto(loc_sock, pk, 76, 0, ad, 16); } }
+  /* receive: hero packets (36 bytes, both sides) and level packets (24 bytes, guest only) */
+  { u32 pk[19]; u8 from[16]; int fl = 16, r, k;
+    for (k = 0; k < 64; k++) { r = recvfrom(loc_sock, pk, 76, 0, from, &fl); fl = 16; if (r <= 0) break;
+      if (r == 76 && pk[0] == LOC_MAGIC_P2 && lk == &loc_lk) loc_p2_in(pk, now);
+      else if (r == 24 && pk[0] == LOC_MAGIC && loc_role == 2) loc_level_in(pk); } }
+  /* the other player's actions as player-2 keys inside this game, F2 while player 2 is absent */
+  if (lk == &loc_lk) {
+    { u32 m = 0; static u32 f2_next; u32 p2in = *(volatile const u32 *)(base - IMAGEBASE + VA_P2LIST) != 0;
+      if (loc_lk.rem_valid && (i32)(now - loc_lk.rem_tick) < 300) { i32 ax = loc_lk.ax, ay = loc_lk.ay; u32 b = loc_lk.buttons;
+        if (ax < -35) m |= 1u << KB_LEFT; if (ax > 35) m |= 1u << KB_RIGHT; if (ay > 35) m |= 1u << KB_UP; if (ay < -35) m |= 1u << KB_DOWN;
+        if (b & BT_ACTION) m |= 1u << KB_ACTION; if (b & BT_SPECIAL) m |= 1u << KB_SPECIAL; if (b & BT_JUMP) m |= 1u << KB_JUMP;
+        if (!p2in && rd32(base - IMAGEBASE + VA_CUR_LEVEL)) {
+          int ready = 1;
+          /* guest: before player 2 joins, my player 1 must be the hero that is player 2 at the host */
+          if (HM_ENABLED && loc_role == 2 && !hm_done && loc_oth_p2 >= 0 && pp_char(0)) { u32 c1 = pp_char(0); i32 my = hero_index(c1); ready = 0;
+            if (!hm_start) { hm_start = now; lbegin(); bs("hero: host has player 1 = list #"); bi(loc_oth_p1); bs(", player 2 = list #"); bi(loc_oth_p2); bs("; my player 1 is #"); bi(my); bs(my == loc_oth_p2 ? " - already the right hero" : " - switching"); lend(); }
+            if (my == loc_oth_p2) { hm_done = 1; ready = 1; lbegin(); bs("hero: my player 1 is now the host's player 2 (list #"); bi(my); bs(") - player 2 may join"); lend(); }
+            else if ((i32)(now - hm_next) >= 0) {
+              if (hm_try && hm_prev_ch == c1) { lbegin(); bs("hero: key "); bh(HM_KEYS[hm_key]); bs(" did not change my hero"); lend(); hm_key++; }
+              if (hm_key >= 3 || hm_try >= 12 || (i32)(now - hm_start) > 30000) { hm_done = 1; ready = 1; say("hero: giving up switching - player 2 joins as it is"); }
+              else { hm_prev_ch = c1; hm_try++; kbi_extra_dik = HM_KEYS[hm_key]; kbi_extra_until = now + 150u; hm_next = now + 2000u; lbegin(); bs("hero: pressing player-1 key "); bh(HM_KEYS[hm_key]); bs(" inside the game (try "); bd(hm_try); bs(")"); lend(); } } }
+          if (ready && (i32)(now - f2_next) >= 0) { f2_next = now + 3000u; kbi_f2_until = now + 150u; say("local link: player 2 is absent - F2 put into this game's keyboard"); } } }
+      kbi_mask = p2in ? m : 0; }
+    if ((i32)(now - loc_p2_log_at) >= 0) { loc_p2_log_at = now + 3000u; if (loc_p2_rx != loc_p2_rx_logged) { loc_p2_rx_logged = loc_p2_rx; lbegin(); bs("local link: other hero packets "); bd(loc_p2_rx); bs(", other hero at mm "); bi(f2mm(loc_lk.rem_px)); bs(" "); bi(f2mm(loc_lk.rem_py)); bs(" "); bi(f2mm(loc_lk.rem_pz)); bs(", buttons "); bbtn(loc_lk.buttons); bs(", player 2 joined: "); bs(*(volatile const u32 *)(base - IMAGEBASE + VA_P2LIST) ? "yes" : "no"); bs(", drift (mm) "); bd((u32)pp_net_dist_mm); bs(" | keyboard reads: state "); bd(kbi_st_calls); bs(", key writes "); bd(kbi_writes); bs(", refused reads replaced "); bd(kbi_fixed); bs(", Acquire calls "); bd(kbi_acq_calls); bs(" refused "); bd(kbi_acq_fail); lend(); } } }
+  if (loc_role == 1) {
+    u32 n = lg_n; if (n && (n != loc_sent_n || (i32)(now - loc_resend_at) >= 0)) { u32 pk[6]; u8 ad[16];
+      pk[0] = LOC_MAGIC; pk[1] = n; pk[2] = lg_idx; pk[3] = lg_flag; pk[4] = lg_prev_idx; pk[5] = lg_dur; loc_addr(ad, LOC_PORT_GUEST); sendto(loc_sock, pk, 24, 0, ad, 16);
+      if (n != loc_sent_n) { lbegin(); bs("local link: sent level "); bd(lg_idx); bs(" flag "); bd(lg_flag); bs(" (request #"); bd(n); bs(", spent "); bd(lg_dur / 1000u); bs(" s in level "); bd(lg_prev_idx); bs(")"); lend(); }
+      loc_sent_n = n; loc_resend_at = now + 1000u; }
+    return;
+  }
+  if (loc_pend_idx != 0xFFFFFFFFu && goto_req < 0) {
+    u32 cur = rd32(base - IMAGEBASE + VA_CUR_LEVEL); u32 lmgr = rd32(base - IMAGEBASE + VA_STREAM_MGR), loading = lmgr ? rd32(lmgr + 0xbc) : 1;
+    /* v2.3d: "quiet" = the game's loader is idle (stream manager +0xbc == 0: the CURLEVEL tests showed it is set when a level starts loading and
+       cleared when loading ends) and at least 1.5 s since the last level request on this copy */
+    int quiet = !loading && (lg_any_n == 0 || (i32)(now - lg_any_t) > 1500);
+    if (lg_any_n && lg_any_idx == loc_pend_idx) { lbegin(); bs("local link: the last level request on this copy is already level "); bd(loc_pend_idx); bs(" - nothing to do"); lend(); loc_pend_idx = 0xFFFFFFFFu; }
+    else if (loc_pend_flag == 1 && lg_any_idx == loc_pend_prev && cur && goto_orig_peek) {   /* the host goes on from the part I am in now */
+      u32 at = lg_any_t + loc_pend_dur + 1500u;
+      if (!loc_sched_logged) { loc_sched_logged = 1; lbegin(); bs("local link: host left level "); bd(loc_pend_prev); bs(" after "); bd(loc_pend_dur / 1000u); bs(" s - I follow after the same time + 1.5 s ("); bd((i32)(at - now) > 0 ? (at - now) / 1000u : 0); bs(" s from now) unless my game moves on by itself first"); lend(); }
+      if ((i32)(now - at) >= 0 && !loading) { lbegin(); bs("local link: time is up, following the host: request level "); bd(loc_pend_idx); bs(" flag "); bd(loc_pend_flag); lend(); goto_flag = (i32)loc_pend_flag; goto_req = (i32)loc_pend_idx; loc_pend_idx = 0xFFFFFFFFu; } }
+    else if (cur && quiet && goto_orig_peek) { lbegin(); bs("local link: following the host: request level "); bd(loc_pend_idx); bs(" "); lv_str(rd32(rd32(base - IMAGEBASE + VA_LEVEL_TAB) + loc_pend_idx * 0xE0u + 0x3c)); bs(" flag "); bd(loc_pend_flag); lend();
+      goto_flag = (i32)loc_pend_flag; goto_req = (i32)loc_pend_idx; loc_pend_idx = 0xFFFFFFFFu; }
+    else if ((i32)(now - loc_wait_log_at) >= 0) { loc_wait_log_at = now + 5000u; lbegin(); bs("local link: waiting to follow the host (level running: "); bs(cur ? "yes" : "no - load your save"); bs(", my game not loading: "); bs(quiet ? "yes" : "no"); bs(")"); lend(); }
+  }
+}
+
+/* ---------------- v2.8a: what names does a hero carry? (discovery, read only) ----------------
+ * When player 1 or player 2 becomes another hero (switch key, story, menu), the first 0xA60 bytes of the character are followed:
+ * every pointer to a readable name-like text is logged (depth 1: char+off -> text; depth 2: char+off -> struct+off2 -> text).
+ * Comparing the lines of two heroes shows which field holds the hero's type / name. */
+static int strcmp_s(const char *a, const char *b) { while (*a && *a == *b) { a++; b++; } return *a != *b; }
+static int hn_text(u32 p, char *out) { char t[48]; int i; if (p < 0x100000u || p > 0x7F000000u || !rd(p, t, 47)) return 0; t[47] = 0;
+  if (!(t[0] >= 'A' && t[0] <= 'Z')) return 0;
+  for (i = 0; t[i]; i++) { char c = t[i]; if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == ' ')) return 0; }
+  if (i < 3 || i > 40) return 0; for (i = 0; i < 48; i++) out[i] = t[i]; return 1; }
+static void hero_names(const char *who, u32 ch) {
+  static u8 buf[0xA60], b2[0x100]; u32 o, o2, lines = 0; char t[48];
+  if (!ch || !rd(ch, buf, sizeof buf)) return;
+  lbegin(); bs("HERO "); bs(who); bs(" is now character "); bh(ch); bs(" (list #"); bi(hero_index(ch)); bs(")"); lend();
+  for (o = 0; o + 4 <= sizeof buf && lines < 60; o += 4) { u32 p = *(u32 *)(buf + o);
+    if (hn_text(p, t)) { lbegin(); bs("  name +"); bh(o); bs(" -> \""); bs(t); bs("\""); lend(); lines++; continue; }
+    if (p > 0x100000u && p < 0x7F000000u && !(p & 3) && rd(p, b2, sizeof b2))
+      for (o2 = 0; o2 + 4 <= sizeof b2 && lines < 60; o2 += 4) if (hn_text(*(u32 *)(b2 + o2), t)) { lbegin(); bs("  name +"); bh(o); bs(" ->+"); bh(o2); bs(" -> \""); bs(t); bs("\""); lend(); lines++; } }
+}
+/* v2.11: where does the split screen keep the size of the halves? (discovery, read only)
+   F3 = remember the split-screen manager (tc_split_mgr, 0x1440 bytes) and the objects at its +0x5c and +0x1424 (0x400 bytes each);
+   F4 = compare with now and log every dword that changed (hex and value*1000 as a float). */
+#define SPW_N 0x1440u
+#define SPW_M 0x400u
+static u8 spw_a[SPW_N], spw_b[SPW_N], spw_a2[2][SPW_M], spw_b2[2][SPW_M]; static u32 spw_have, spw_ptr[2];
+static void spw_diff(const char *what, const u8 *a, const u8 *b, u32 n, u32 *lines) { u32 o;
+  for (o = 0; o + 4 <= n && *lines < 160; o += 4) { u32 x = *(const u32 *)(a + o), y = *(const u32 *)(b + o); float fx, fy; if (x == y) continue;
+    memcpy(&fx, &x, 4); memcpy(&fy, &y, 4);
+    lbegin(); bs("  "); bs(what); bs(" +"); bh(o); bs(": "); bh(x); bs(" -> "); bh(y);
+    if ((x & 0x7F800000u) != 0x7F800000u && (y & 0x7F800000u) != 0x7F800000u && fx > -100000.0f && fx < 100000.0f && fy > -100000.0f && fy < 100000.0f) { bs("   as float*1000: "); bi(f2mm(fx)); bs(" -> "); bi(f2mm(fy)); }
+    lend(); (*lines)++; } }
+static void spw_tick(u32 fg) { static u32 p3, p4; u32 k3 = (GetAsyncKeyState(0x72) & 0x8000) != 0, k4 = (GetAsyncKeyState(0x73) & 0x8000) != 0, m = tc_split_mgr, i;
+  if (k3 && !p3 && fg && !cen_on) {
+    if (!m || !rd(m, spw_a, SPW_N)) say("split watch: F3 - the split-screen manager is not known yet (no level?)");
+    else { for (i = 0; i < 2; i++) { spw_ptr[i] = rd32(m + (i ? 0x1424u : 0x5cu)); if (!spw_ptr[i] || !rd(spw_ptr[i], spw_a2[i], SPW_M)) memset(spw_a2[i], 0, SPW_M); }
+      spw_have = 1; lbegin(); bs("split watch: F3 - remembered the manager "); bh(m); bs(" (mode "); bd(rd32(m + 0x13f8)); bs("), +0x5c -> "); bh(spw_ptr[0]); bs(", +0x1424 -> "); bh(spw_ptr[1]); bs(" - now change the screen and press F4"); lend(); } }
+  if (k4 && !p4 && fg && !cen_on) {
+    if (!spw_have || !m || !rd(m, spw_b, SPW_N)) say("split watch: F4 - press F3 first");
+    else { u32 lines = 0; lbegin(); bs("split watch: F4 - changes since F3 (mode now "); bd(rd32(m + 0x13f8)); bs("):"); lend();
+      spw_diff("mgr", spw_a, spw_b, SPW_N, &lines);
+      for (i = 0; i < 2; i++) if (spw_ptr[i] && rd32(m + (i ? 0x1424u : 0x5cu)) == spw_ptr[i] && rd(spw_ptr[i], spw_b2[i], SPW_M)) spw_diff(i ? "[+0x1424]" : "[+0x5c]", spw_a2[i], spw_b2[i], SPW_M, &lines);
+      lbegin(); bs("split watch: "); bd(lines); bs(lines >= 160 ? " lines (cut at 160)" : " lines"); lend(); } }
+  p3 = k3; p4 = k4; }
+/* v2.9: F8 = read teracoop_hero.txt (a hero name like Legolas) and give it to player 1 on the game thread */
+static int hero_fn_ok(void) { const u8 *a = (const u8 *)(base - IMAGEBASE + VA_TYPE_BY_NAME), *b = (const u8 *)(base - IMAGEBASE + VA_CUR_TYPE), *c = (const u8 *)(base - IMAGEBASE + VA_SWAP_TYPE);
+  return a[0] == 0x8B && a[1] == 0x44 && a[2] == 0x24 && a[3] == 0x04 && a[4] == 0x8B && a[5] == 0x0D && b[0] == 0x56 && b[1] == 0x8B && b[2] == 0xF1 && b[3] == 0xE8
+      && (tc_swap_back ? 1 : c[0] == 0x55) && (tc_swap_back || (c[1] == 0x8B && c[2] == 0xEC && c[3] == 0x83 && c[4] == 0xE4 && c[5] == 0xF0)) && c[6] == 0x6A && c[7] == 0xFF
+      && ((const u8 *)(base - IMAGEBASE + VA_CLU_CTOR))[0] == 0x6A && ((const u8 *)(base - IMAGEBASE + VA_CLU_CTOR))[2] == 0x68 && ((const u8 *)(base - IMAGEBASE + VA_CLU_CTOR))[3] == 0x78
+      && ((const u8 *)(base - IMAGEBASE + VA_CLU_TICK))[0] == 0x56 && ((const u8 *)(base - IMAGEBASE + VA_CLU_TICK))[1] == 0x57 && ((const u8 *)(base - IMAGEBASE + VA_CLU_TICK))[2] == 0x8B && ((const u8 *)(base - IMAGEBASE + VA_CLU_TICK))[3] == 0xF9; }
+static void hero_f8(void) { u16 fp[460]; PV h; char t[64]; u32 got = 0, i, k = 0;
+  lbegin(); bs("hero: F8 pressed - ");
+  if (!goto_orig_peek) { bs("no PeekMessageA hook, nothing done"); lend(); return; }
+  if (!hero_fn_ok()) { bs("the game's hero functions have unexpected bytes, nothing done"); lend(); return; }
+  mkpath(fp, L"teracoop_hero.txt"); h = CreateFileW(fp, 0x80000000u, 7, 0, 3, 0x80, 0);
+  if (h && h != (PV)-1) { ReadFile(h, t, 63, &got, 0); CloseHandle(h); }
+  for (i = 0; i < got && k < 47; i++) { char c = t[i]; if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') hero_want[k++] = c; else if (k) break; }
+  hero_want[k] = 0;
+  if (!k) { bs("teracoop_hero.txt has no hero name (example: Legolas)"); lend(); return; }
+  bs("asking the game to make player 1 \""); bs(hero_want); bs("\""); lend(); hero_req_slot = 0; hero_req = 1; }
+static void hero_result(void) { static u32 seen; if (hero_seq == seen) return; seen = hero_seq;
+  lbegin(); bs("hero: game thread: ");
+  if (hero_res_ch == 0xFFFFFFFFu) bs("no level running, nothing done");
+  else if (!hero_res_ch) { bs("no player "); bd(hero_res_slot + 1); bs(" character, nothing done"); }
+  else if (hero_res_type < 0) { bs("the game does not know the hero \""); bs(hero_want); bs("\" (type -1)"); }
+  else if (hero_res_ret == 0xBAD0u) bs("the loader object is not the expected CharLoaderUtilSwap, nothing done");
+  else { bs("player "); bd(hero_res_slot + 1); bs(" character "); bh(hero_res_ch); bs(" type "); bi(hero_res_old); bs(" -> "); bi(hero_res_type); bs(" (\""); bs(hero_want); bs("\"): loading asked, waiting"); }
+  lend(); }
+static void hero_loader_result(void) { static u32 seen; if (hsw_done_seq == seen) return; seen = hsw_done_seq;
+  lbegin(); bs("hero: loader "); bs(hsw_timeout ? "gave up after " : "finished after "); bd(hsw_done_ms); bs(" ms, "); bd(hsw_frames); bs(" frames"); lend(); }
+/* v2.8c: switching hero from the in-game menu keeps the SAME character object and only changes its data (log v2.8b: char 0x1ec1d800
+   stayed, +0x24 name pointer / +0x20 / +0x40 changed) - so a hero change = other object OR other name text at +0x24. */
+static void hero_one(const char *who, u32 c, u32 *lastc, char *lastn, u32 *last20) { char t[48]; u32 v20;
+  if (!c) return; if (!hn_text(rd32(c + 0x24), t)) t[0] = 0; v20 = rd32(c + 0x20);
+  if (c == *lastc && !strcmp_s(t, lastn) && v20 == *last20) return;
+  lbegin(); bs("HERO "); bs(who); bs(c == *lastc ? " same character " : " other character "); bh(c); bs(" name +0x24 \""); bs(t); bs("\" (+0x20 = "); bh(v20); bs(", +0x40 = "); bh(rd32(c + 0x40)); bs(")"); lend();
+  if (c != *lastc) hero_names(who, c);
+  *lastc = c; *last20 = v20; { int i; for (i = 0; i < 47 && t[i]; i++) lastn[i] = t[i]; lastn[i] = 0; } }
+static void hero_watch(void) { static u32 l1, l2, a1, a2; static char n1[48], n2[48];
+  hero_one("player 1", pp_char(0), &l1, n1, &a1); hero_one("player 2", pp_char(1), &l2, n2, &a2); }
+
 /* ---------------- worker ---------------- */
 static u32 __stdcall worker(PV arg) {
   u32 pe = 0, ts, soi, last_open = 0, last_f2 = 0, last_p2 = 0, prog_ok_prev = 0;
@@ -852,12 +1511,20 @@ static u32 __stdcall worker(PV arg) {
   /* the controls of this PC: copies of Mappings.dat and pcconfig.txt next to the log (opened with full sharing: the game may keep Mappings.dat open) */
   cfg_copy(L"Mappings.dat", "Mappings.dat", L"config-Mappings", L".dat");
   cfg_copy(L"pcconfig.txt", "pcconfig.txt", L"config-pcconfig", L".txt");
-  lbegin(); bs("teracoop module v2.1c (F11 data recording, F3/F4/F5 markers, F6 pad injection test, F7 list mirror (OFF by default), controls from Mappings.dat) started, exe base "); bh(base); bs(" timestamp "); bh(ts); bs(" size "); bh(soi); lend();
+  lbegin(); bs("teracoop module v2.14 (smooth other hero: speed prediction + 25%/frame on the game thread; OWN SCREEN: teracoop_view.txt own = one screen camera on player 1 only + transitions do not wait for the camera; tiny polygon 16-byte aligned - the game reads it with movaps; full: player 1's view polygon = whole window, player 2's = tiny corner; teracoop_view.txt full = split line moved off screen, no crop; own-screen test, left half only while the screen is split with player 2: teracoop_view.txt left / left wide, F6 = left half on/off, split submode forced vertical; split watch: F3 remember / F4 compare the split-screen manager; HERO SYNC by name both ways, only when the other player CHANGES hero: my player 2 = the other copy's player 1; F8 = hero from teracoop_hero.txt through the game's CharLoaderUtilSwap: load, then swap; SWAP = every hero change of the game logged with its callers; F8 = make player 1 the hero named in teracoop_hero.txt; HERO name at +0x24 logged on every change; hero matching off; one screen: F7 / teracoop_split.txt = off; local link both ways, exact position and heading: the other copy's hero = my player 2; of two copies via teracoop_local.txt; GOTO requests in the log; CURLEVEL = the game's own current-level accessor; F5 = go to level from teracoop_goto.txt; LEVEL changes and ADDED/KILLED character events in the log; window mode via teracoop_windowed.txt; second copy via teracoop_multi.txt; F11 data recording, F3/F4/F5 markers, F6 pad injection test, F7 list mirror (OFF by default), controls from Mappings.dat) started, exe base "); bh(base); bs(" timestamp "); bh(ts); bs(" size "); bh(soi); lend();
   build_ok = (ts == TIMESTAMP && soi == SIZEOFIMAGE);
   /* overlay: install at once (the game has not created its Direct3D device yet), retry a few times */
-  { u16 fp[460]; mkpath(fp, L"teracoop_overlay.txt"); if (GetFileAttributesW(fp) == 0xFFFFFFFFu) { ov_tries = 99; say("overlay: panel is switched off (create the file teracoop_overlay.txt in the game folder to try it)"); } }
+  win_load(); view_load(); own_load();
+  say(multi_set ? "second copy: allowed (teracoop_multi.txt - the game's own single-copy check is skipped)" : "second copy: blocked as usual (create teracoop_multi.txt in the game folder to allow it)");
+  if (win_force) { lbegin(); bs("window mode: ON (teracoop_windowed.txt), window "); bd(win_w); bs("x"); bd(win_h); if (win_x >= 0) { bs(" at "); bd((u32)win_x); bs(","); bd((u32)win_y); } else bs(" centred"); lend(); }
+  else say("window mode: off (create the file teracoop_windowed.txt in the game folder to play in a window)");
+  { u16 fp[460]; mkpath(fp, L"teracoop_overlay.txt"); if (GetFileAttributesW(fp) == 0xFFFFFFFFu) { ov_no_panel = 1; if (!win_force) ov_tries = 99; say("overlay: panel is switched off (create the file teracoop_overlay.txt in the game folder to try it)"); } }
   if (ov_tries != 99) { long hr = 0; int r = ov_install(&hr); lbegin(); bs("overlay: hook install step "); bd((u32)r); bs(" hresult "); bh((u32)hr); lend(); ov_state = r == 0; ov_tries = 1; ov_hint_until = GetTickCount() + 120000u; }
   if (build_ok) { CreateThread(0, 0, puppet_thread, 0, 0, 0); pe_ranges(); load_bindings("start"); }
+  if (build_ok) { goto_install(); loc_start(); split_install(); swap_install(); view_patch(); view_full_patch(); view_poly_install(); own_patch();
+    { u16 fp[460]; PV h; char t[8]; u32 got = 0; mkpath(fp, L"teracoop_split.txt"); h = CreateFileW(fp, 0x80000000u, 7, 0, 3, 0x80, 0);
+      if (h && h != (PV)-1) { ReadFile(h, t, 7, &got, 0); CloseHandle(h); if (got >= 3 && (t[0] | 32) == 'o' && (t[1] | 32) == 'f') { split_off_on = 1; say("split: teracoop_split.txt = off - one screen for every level (levels.txt flag split_off)"); } } } }
+  if (build_ok) { tc_hook(VA_EV_ADDED, tc_stub_added, &tc_added_imm, &tc_added_back, "ADDED (FUN_0095d300)"); tc_hook(VA_EV_KILLED, tc_stub_killed, &tc_killed_imm, &tc_killed_back, "KILLED (FUN_0095d380)"); tc_hook(VA_EV_GOTO, tc_stub_goto, &tc_goto_imm, &tc_goto_back, "GOTO (FUN_00b169d0)"); }
   say(build_ok ? "game build supported" : "game build NOT supported - the module will not touch the game");
   for (;;) {
     u32 now, state = 0, p2 = 0, fg, prog_alive, want = 0, want_join = 0;
@@ -865,7 +1532,7 @@ static u32 __stdcall worker(PV arg) {
     /* the F11 dump of step 5.1 is finished and switched off (F11 must stay free for the game and for screenshots) */
     { static u32 nlog_at, nsig; if ((i32)(now - nlog_at) >= 0) { u32 sg = pp_net_writes + pp_net_snaps * 3 + pp_net_none * 5; nlog_at = now + 3000u; if (sg != nsig) { nsig = sg; lbegin(); bs("puppet-net: writes "); bd(pp_net_writes); bs(" snaps "); bd(pp_net_snaps); bs(" no-p2-frames "); bd(pp_net_none); bs(" distance (mm) "); bd((u32)pp_net_dist_mm); lend(); } } }
     { u32 f8 = (GetAsyncKeyState(0x77) & 0x8000) != 0; static u32 f8_prev, pp_log_at, pp_sig;
-      if (f8 && !f8_prev && game_fg()) { pp_mode = (pp_mode + 1) % 3; pp_have = 0; lbegin(); bs("puppet: mode "); bd(pp_mode); bs(pp_mode == 0 ? " (off)" : pp_mode == 1 ? " (A: matrix only)" : " (B: all copies)"); lend(); }
+      if (f8 && !f8_prev && game_fg()) hero_f8();
       f8_prev = f8;
       if (pp_mode && (i32)(now - pp_log_at) >= 0) { u32 sig = pp_writes + pp_kept * 3 + pp_reverted * 5 + pp_noP2 * 7; pp_log_at = now + 2000u;
         if (sig != pp_sig) { pp_sig = sig; lbegin(); bs("puppet: writes "); bd(pp_writes); bs(" kept "); bd(pp_kept); bs(" reverted "); bd(pp_reverted); bs(" no-p2-frames "); bd(pp_noP2); bs(" last revert dx/dz (mm) "); if (pp_lastdx < 0) { bs("-"); bd((u32)-pp_lastdx); } else bd((u32)pp_lastdx); bs("/"); if (pp_lastdz < 0) { bs("-"); bd((u32)-pp_lastdz); } else bd((u32)pp_lastdz); bs(" p2 char "); bh(pp_lastch); lend(); } } }
@@ -873,7 +1540,7 @@ static u32 __stdcall worker(PV arg) {
     if (!ov_state && ov_tries && ov_tries < 40 && (i32)(now - ov_try_at) >= 0) { long hr = 0; int r = ov_install(&hr); ov_tries++; ov_try_at = now + 500u; if (r == 0) { ov_state = 1; lbegin(); bs("overlay: hook installed on try "); bd(ov_tries); lend(); } else if (ov_tries == 40) { lbegin(); bs("overlay: giving up, last step "); bd((u32)r); bs(" hresult "); bh((u32)hr); lend(); } }
     if (ov_state) {
       u32 f9 = (GetAsyncKeyState(0x78) & 0x8000) != 0; ov_lk = (PV)lk;
-      if (f9 && !f9_prev && game_fg()) { ov_on = !ov_on; }
+      if (f9 && !f9_prev && game_fg() && !ov_no_panel) { ov_on = !ov_on; }
       f9_prev = f9;
       if (ov_on != ov_on_prev) { ov_on_prev = ov_on; lbegin(); bs(ov_on ? "overlay: panel opened (F9)" : "overlay: panel closed (F9)"); bs(", frames "); bd(ov_frames); bs(", errors "); bd(ov_errs); bs(", picture "); bd(ov_last_w); bs("x"); bd(ov_last_h); lend(); }
       if (ov_patched_vt) { /* something else (e.g. the Steam overlay) may overwrite the table entry after us: put ours back, keep the other as the original so the chain still works */
@@ -890,7 +1557,22 @@ static u32 __stdcall worker(PV arg) {
           bs(" flags "); bh(ov_cd_flags); bs(" hr "); bh(ov_cd_hr); bs(" devvt "); bh(ov_real_vt); bs(" dummyvt "); bh(ov_dummy_vt); bs(" scvt "); bh(ov_real_scvt); bs(" dummyscvt "); bh(ov_dummy_scvt); bs(" dev "); bh(ov_dev_ptr); bs(" patched "); bh(ov_patched_vt); bs(" entry17 "); bh(ov_patched_vt ? rd32(ov_patched_vt + 68) : 0); bs(" orig17 "); bh((u32)ov_orig_present_r); lend(); } }
       if (!ov_frames_logged && ov_frames) { ov_frames_logged = 1; say("overlay: the game is presenting frames through the hook"); }
     }
-    if (build_ok) { u32 fg0 = (u32)game_fg(); census_tick(now, fg0); enemy_tick(now, fg0); }
+    if (build_ok) { tcev_drain(); level_tick(); goto_tick((u32)game_fg()); loc_tick(now); hero_watch(); hero_result(); hero_loader_result(); swap_drain(); if (loc_role) hero_sync_tick(now); spw_tick((u32)game_fg()); view_tick((u32)game_fg()); }
+    if (build_ok && tc_split_back) { u32 f7 = (GetAsyncKeyState(0x76) & 0x8000) != 0; static u32 sn, f7p, last_arg = 0xFFFFFFFFu, last_mgr, so_next; static u8 so_orig[1024]; static u32 so_have;
+      /* the game calls FUN_0085b9a0 every frame (v2.7 log: thousands of calls): 0 = split screen, 1 = one screen (FUN_009d6120 picks 1 when the
+         level has the levels.txt flag split_off = entry +0xd4 bit 0x800, or in the hub, or when DAT_015b4f01 is 0). Only changes are logged. */
+      if (tc_split_n != sn) { sn = tc_split_n; if (tc_split_arg != last_arg || tc_split_mgr != last_mgr) { last_arg = tc_split_arg; last_mgr = tc_split_mgr; lbegin(); bs("SPLIT: game now uses mode "); bd(tc_split_arg); bs(tc_split_arg == 0 ? " (split screen)" : tc_split_arg == 1 ? " (one screen)" : ""); bs(" (manager "); bh(tc_split_mgr); bs(", calls so far "); bd(sn); bs(")"); lend(); } }
+      /* v2.7a: "split off" = the game's own levels.txt flag put on every level (F7 switches it on/off; teracoop_split.txt = off switches it on at start) */
+      if (f7 && !f7p && game_fg()) { split_off_on = !split_off_on; lbegin(); bs("split: F7 - one screen for every level "); bs(split_off_on ? "ON" : "OFF (the levels' own setting again)"); lend(); so_next = 0; }
+      f7p = f7;
+      if ((i32)(now - so_next) >= 0) { u32 tab = rd32(base - IMAGEBASE + VA_LEVEL_TAB), cnt = rd32(base - IMAGEBASE + VA_LEVEL_CNT), i, ch = 0; so_next = now + 2000u;
+        if (tab && cnt && cnt <= 1024) {
+          if (!so_have) { for (i = 0; i < cnt; i++) so_orig[i] = (u8)((rd32(tab + i * 0xE0u + 0xd4) >> 11) & 1u); so_have = 1; }
+          for (i = 0; i < cnt; i++) { u32 a = tab + i * 0xE0u + 0xd4, v = rd32(a), want = split_off_on ? (v | 0x800u) : so_orig[i] ? (v | 0x800u) : (v & ~0x800u);
+            if (want != v) { *(volatile u32 *)a = want; ch++; } }
+          if (ch) { lbegin(); bs("split: levels.txt flag split_off "); bs(split_off_on ? "put on " : "given back on "); bd(ch); bs(" of "); bd(cnt); bs(" levels"); lend(); } } } }
+    { static u32 wsig; u32 sg = win_cd_n + win_reset_n * 7 + win_fix_n * 31; if (win_force && sg != wsig) { wsig = sg; lbegin(); bs("window mode: CreateDevice "); bd(win_cd_n); bs(" Reset "); bd(win_reset_n); bs(" window set "); bd(win_fix_n); bs(" hwnd "); bh(win_hwnd); lend(); } }
+    if (build_ok) { u32 fg0 = (u32)game_fg(); census_tick(now, fg0); if (lk != &loc_lk) enemy_tick(now, fg0); }   /* the old enemy-list mirror is not used with the local link */
     if (!lk) {
       if (now - last_open < 500u && last_open) continue;
       last_open = now ? now : 1;
@@ -937,7 +1619,7 @@ static u32 __stdcall worker(PV arg) {
     if (!(build_ok && fg)) want = 0;
     if (!prog_alive) want = 0;
     { static u32 f6_prev, padlog_at; u32 f6 = (GetAsyncKeyState(0x75) & 0x8000) != 0;
-      if (f6 && !f6_prev && fg) { inj_pad = !inj_pad; lbegin(); bs("pad-inject mode "); bs(inj_pad ? "ON (the friend's actions are written straight into the pad of player 2, no keys)" : "OFF (keys of this PC's Mappings.dat)"); bs(" (F6)"); lend(); }
+      if (f6 && !f6_prev && fg && !view_on) { inj_pad = !inj_pad; lbegin(); bs("pad-inject mode "); bs(inj_pad ? "ON (the friend's actions are written straight into the pad of player 2, no keys)" : "OFF (keys of this PC's Mappings.dat)"); bs(" (F6)"); lend(); }
       f6_prev = f6;
       if (inj_pad && (i32)(now - padlog_at) >= 0) { padlog_at = now + 2000u; if (padi_writes || padi_fail) { lbegin(); bs("pad-inject: writes "); bd(padi_writes); bs(" failed (pad not found) "); bd(padi_fail); lend(); } } }
     if (inj_pad) want = 0;
@@ -954,21 +1636,41 @@ static u32 __stdcall worker(PV arg) {
 /* ---------------- swallow the game input while the panel is open ----------------
  * The game reads keyboard / mouse / pad through DirectInput 8. Every device we see being created gets its GetDeviceState / GetDeviceData table entries replaced (per table, with its own originals);
  * while the panel is open the result is emptied (all keys released, no events), so the game does not react to what is typed for the panel. */
-typedef struct { u32 vt; void *st, *dt; } DIHK;
+typedef struct { u32 vt; void *st, *dt, *acq; } DIHK;
 static DIHK dihk[6]; static volatile u32 dihk_n;
 static DIHK *dihk_find(PV dev) { u32 i, v = (u32)VT(dev); for (i = 0; i < dihk_n; i++) if (dihk[i].vt == v) return &dihk[i]; return 0; }
+/* v2.5: player 2 of the host is played by keys that exist only inside this game: the keyboard state the game reads through
+ * DirectInput (GetDeviceState, 256 bytes, indexed by DIK codes) gets the player-2 keys of Mappings.dat set while the guest presses them,
+ * plus F2 to let player 2 join. Works when the window is not active (if DirectInput refuses then, an empty keyboard is returned instead). */
 static long __stdcall hk_dstate(PV dev, u32 cb, void *data) {
   DIHK *h = dihk_find(dev); long hr; u32 i;
   if (!h) return (long)0x80004005;
   hr = ((long (__stdcall *)(PV, u32, void *))h->st)(dev, cb, data);
+  kbi_st_calls++;
   if (hr >= 0 && ov_on && data) for (i = 0; i < cb; i++) ((volatile u8 *)data)[i] = 0;
+  if (kbi_on && cb == 256 && data) { u32 m = kbi_mask; volatile u8 *k = (volatile u8 *)data;
+    if (hr < 0) { for (i = 0; i < 256; i++) k[i] = 0; hr = 0; kbi_fixed++; }
+    for (i = 0; i < KB_N; i++) if (m & (1u << i)) k[(KSC[i] & 0x7Fu) | (KEXT[i] ? 0x80u : 0u)] = 0x80;
+    if ((i32)(GetTickCount() - kbi_f2_until) < 0) k[0x3C] = 0x80;
+    if (kbi_extra_dik && (i32)(GetTickCount() - kbi_extra_until) < 0) k[kbi_extra_dik & 0xFFu] = 0x80;
+    if (m) kbi_writes++; }
   return hr;
 }
 static long __stdcall hk_ddata(PV dev, u32 cbo, void *dod, u32 *cnt, u32 fl) {
   DIHK *h = dihk_find(dev); long hr;
   if (!h) return (long)0x80004005;
   hr = ((long (__stdcall *)(PV, u32, void *, u32 *, u32))h->dt)(dev, cbo, dod, cnt, fl);
+  kbi_dt_calls++; if (hr >= 0 && cnt && dod && *cnt) kbi_dt_events += *cnt;
   if (hr >= 0 && ov_on && cnt) *cnt = 0;
+  return hr;
+}
+/* v2.5b: in a window that is not active DirectInput refuses Acquire and the game then does not read the keyboard at all;
+ * for the host of the one-PC test a refused Acquire is reported as success, so the game goes on to GetDeviceState (whose refusal is replaced above). */
+static long __stdcall hk_acquire(PV dev) {
+  DIHK *h = dihk_find(dev); long hr;
+  if (!h) return (long)0x80004005;
+  hr = ((long (__stdcall *)(PV))h->acq)(dev); kbi_acq_calls++;
+  if (hr < 0) { kbi_acq_fail++; if (kbi_on) hr = 0; }
   return hr;
 }
 static void *dihk_orig_create;
@@ -976,7 +1678,7 @@ static long __stdcall hk_dicreate(PV di, const void *guid, PV *ppdev, PV outer) 
   long hr = ((long (__stdcall *)(PV, const void *, PV *, PV))dihk_orig_create)(di, guid, ppdev, outer);
   if (hr >= 0 && ppdev && *ppdev && !dihk_find(*ppdev) && dihk_n < 6) {
     void **vt = VT(*ppdev); u32 old;
-    if (VirtualProtect(&vt[9], 8, 4, &old)) { DIHK *h = &dihk[dihk_n]; h->vt = (u32)vt; h->st = vt[9]; h->dt = vt[10]; vt[9] = (void *)hk_dstate; vt[10] = (void *)hk_ddata; VirtualProtect(&vt[9], 8, old, &old); dihk_n++; }
+    if (VirtualProtect(&vt[7], 16, 4, &old)) { DIHK *h = &dihk[dihk_n]; h->vt = (u32)vt; h->st = vt[9]; h->dt = vt[10]; h->acq = vt[7]; vt[9] = (void *)hk_dstate; vt[10] = (void *)hk_ddata; vt[7] = (void *)hk_acquire; VirtualProtect(&vt[7], 16, old, &old); dihk_n++; }
   }
   return hr;
 }
@@ -1019,8 +1721,22 @@ long __stdcall DirectInput8Create(PV hinst, u32 ver, const void *riid, PV *out, 
   }
   { long hr = real(hinst, ver, riid, out, outer); if (hr >= 0 && out && *out) dihk_wrap(*out); return hr; }
 }
+/* ---------------- v2.2c: second copy of the game on the same PC (file teracoop_multi.txt in the game folder) ----------------
+ * WinMain refuses a second copy: FUN_0067ce60 creates the mutex "TTALES-{<title>}" and quits when it already exists, unless the game's own
+ * flag DAT_0157c840 is set (its command-line option 0x44 sets it; the option's text is not known). dinput8.dll is in the import table of the exe,
+ * so this DllMain runs before WinMain and can set the flag. The flag has exactly one reader (0x0067ceb3) and one writer (0x0067d647). */
+#define VA_MULTI_OK 0x0157c840u
+static void multi_allow(void) {
+  u16 p[420]; int n; u32 b = (u32)GetModuleHandleW(0), pe, ts, soi; static const u16 f[] = L"teracoop_multi.txt"; int k;
+  pe = *(const u32 *)(b + 0x3c); ts = *(const u32 *)(b + pe + 8); soi = *(const u32 *)(b + pe + 24 + 56);
+  if (ts != TIMESTAMP || soi != SIZEOFIMAGE) return;
+  n = (int)GetModuleFileNameW(0, p, 380); while (n > 0 && p[n - 1] != '\\') n--;
+  for (k = 0; f[k]; k++) p[n + k] = f[k]; p[n + k] = 0;
+  if (GetFileAttributesW(p) == 0xFFFFFFFFu) return;
+  *(volatile u32 *)(b - IMAGEBASE + VA_MULTI_OK) = 1; multi_set = 1;
+}
 int __stdcall DllMain(PV h, u32 reason, PV res) {
   (void)res;
-  if (reason == 1) { DisableThreadLibraryCalls(h); AddVectoredExceptionHandler(1, exc_handler); CreateThread(0, 0, worker, 0, 0, 0); }
+  if (reason == 1) { DisableThreadLibraryCalls(h); multi_allow(); AddVectoredExceptionHandler(1, exc_handler); CreateThread(0, 0, worker, 0, 0, 0); }
   return 1;
 }

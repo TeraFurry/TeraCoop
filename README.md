@@ -4,7 +4,7 @@
 
 An experimental mod that tries to let two people play **LEGO® The Lord of the Rings™** (PC, Steam app 214510) together **online** over Steam, without port forwarding. The game itself only has local (same-screen) co-op. Nobody has published an online co-op for it, so this is built from scratch by reverse engineering. It follows the approach of [cranebeaker/coop-anything](https://github.com/cranebeaker/coop-anything).
 
-> **Status: early prototype.** Two players can connect and the second player can be controlled over the network (movement, jump, attack, special). The world (enemies, coins, deaths, breakables) is **not** synchronized yet. See [docs/STATUS.md](docs/STATUS.md).
+> **Status: early prototype.** Two players can connect and the second player can be controlled over the network (movement, jump, attack, special). Module v2.x (tested on two copies on one PC): hero sync, hero change through the game's loader, own full screen for each player with working zone transitions. The world (enemies, coins, deaths, breakables) is **not** synchronized yet. See [docs/STATUS.md](docs/STATUS.md).
 
 This repository contains **only our own source code and notes**. It does **not** contain any game files, game code, decompiled code, the game's data, Valve's `steam_api.dll`, or any third-party binaries. You need your own legal copy of the game.
 
@@ -35,7 +35,7 @@ MIT (see `LICENSE`): anyone may use, copy, modify and distribute the code. Game,
 
 Экспериментальный мод, который пытается дать двум игрокам играть в **LEGO® The Lord of the Rings™** (PC, Steam, app 214510) вместе **по сети** через Steam, без проброса портов. В самой игре есть только кооператив на одном экране. Онлайн-кооператив для неё никто не публиковал, поэтому мы делаем его с нуля, разбирая игру. Подход взят из [cranebeaker/coop-anything](https://github.com/cranebeaker/coop-anything).
 
-> **Состояние: ранний прототип.** Два игрока могут подключиться, второй игрок управляется по сети (движение, прыжок, удар, особое действие). Мир (враги, монетки, смерти, ломающиеся предметы) **пока не синхронизируется**. Подробнее в [docs/STATUS.md](docs/STATUS.md).
+> **Состояние: ранний прототип.** Два игрока могут подключиться, второй игрок управляется по сети (движение, прыжок, удар, особое действие). Модуль v2.x (проверено на двух копиях на одном ПК): синхронизация героя, смена героя через загрузчик игры, свой полный экран у каждого игрока с рабочими переходами. Мир (враги, монетки, смерти, ломающиеся предметы) **пока не синхронизируется**. Подробнее в [docs/STATUS.md](docs/STATUS.md).
 
 В репозитории **только наш исходный код и заметки**. Здесь **нет** файлов игры, кода игры, декомпилированного кода, данных игры, `steam_api.dll` от Valve и чужих программ. Нужна своя легальная копия игры.
 

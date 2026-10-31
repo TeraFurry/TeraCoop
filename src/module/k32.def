@@ -32,3 +32,4 @@ ReadFile@20
 GetLastError@0
 SetThreadPriority@8
 GetCurrentThread@0
+FlushInstructionCache@12

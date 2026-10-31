@@ -6,3 +6,7 @@ SendInput@12
 GetAsyncKeyState@4
 CreateWindowExW@48
 DestroyWindow@4
+SetWindowLongW@12
+SetWindowPos@28
+GetSystemMetrics@4
+AdjustWindowRect@12
